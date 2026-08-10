@@ -1,0 +1,68 @@
+# Fork-only manual CI wrapper. Not upstream's file and never sent upstream:
+# it exists solely so a feature branch on this fork can be verified without
+# opening a pull request. It carries ci.yml's `verify` job steps behind a
+# workflow_dispatch checkout of the ref passed in.
+#
+# The paths-filter gating in ci.yml is deliberately absent: it computes a diff
+# against a base ref that workflow_dispatch does not have, and every step it
+# guards is one we want to run unconditionally here anyway.
+name: osc-manual
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_ref:
+        description: The branch, tag or SHA to verify
+        required: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: "${{ inputs.target_ref }}"
+
+      - name: Show checked-out ref
+        run: |
+          echo "requested ref: ${{ inputs.target_ref }}"
+          echo "checked-out SHA: $(git rev-parse HEAD)"
+          git log -1 --oneline
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt-formatted:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: test
+        run: make test
+
+      - name: cross-compile (no-cgo arm64)
+        run: make cross
+
+      - name: Install goreleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          install-only: true
+
+      - name: goreleaser check
+        # Exit 2 = valid config with deprecated options — accepted: `brews` is
+        # deliberate (casks can't declare brew services). Exit 1 = invalid,
+        # still fails.
+        run: |
+          goreleaser check && exit 0
+          rc=$?
+          [ "$rc" = 2 ] || exit "$rc"
