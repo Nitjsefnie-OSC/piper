@@ -1,12 +1,16 @@
 package tui
 
 import (
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/piperbox/piper/internal/config"
+	"github.com/piperbox/piper/internal/relayclient"
 )
 
 // seedConfig points HOME at a temp dir and writes cf there, so config
@@ -22,6 +26,34 @@ func seedConfig(t *testing.T, cf config.ClientFile) {
 // fakeDialer returns a Dialer that always yields the given result.
 func fakeDialer(c API, addr string, remote bool, err error) Dialer {
 	return func(config.Box) (API, string, bool, error) { return c, addr, remote, err }
+}
+
+// newRelayBoxesView uses the same root wiring as the product: the root injects
+// its relay factory when it pushes the boxes view.
+func newRelayBoxesView(t *testing.T, dial Dialer, relay RelayDialer) boxesView {
+	t.Helper()
+	m := NewModel("local", "", false, fakeAPI{}).WithDialer(dial).WithRelay(relay)
+	_, cmd := m.Update(keyRunes('t'))
+	push, ok := cmd().(pushMsg)
+	if !ok {
+		t.Fatalf("t should push boxesView, got %T", cmd())
+	}
+	return push.view.(boxesView)
+}
+
+func agentsServer(t *testing.T, agents []relayclient.Agent) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/agents" {
+			t.Errorf("agents request = %s %s, want GET /agents", r.Method, r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer cred-xyz" {
+			t.Errorf("agents authorization = %q, want bearer credential", got)
+		}
+		_ = json.NewEncoder(w).Encode(struct {
+			Agents []relayclient.Agent `json:"agents"`
+		}{Agents: agents})
+	}))
 }
 
 func TestBoxesViewLoadsFromConfig(t *testing.T) {
@@ -124,13 +156,9 @@ func TestEnterOnLANBoxWithRelayCredsEmitsSwitch(t *testing.T) {
 	}
 }
 
-func TestEnterOnRelayOnlyBoxExplains(t *testing.T) {
-	// A relay-only box (no LAN address) is not switchable here; enter must say
-	// so instead of silently doing nothing. The note is view-local — an errMsg
-	// cmd would reach the root, which reads any errMsg as a failed poll and
-	// banners the healthy current box as unreachable.
+func TestEnterOnRelayOnlyBoxEmitsSwitch(t *testing.T) {
 	load := boxesLoadedMsg{
-		boxes:   []config.Box{{Name: "pi4"}, {Name: "cloud", RelayAPI: "https://r.example"}},
+		boxes:   []config.Box{{Name: "pi4"}, {Name: "cloud.example", RelayAPI: "https://r.example", AccountCredential: "cred-xyz"}},
 		current: "pi4",
 	}
 	v := newBoxesView(fakeDialer(fakeAPI{}, "", false, nil))
@@ -138,32 +166,104 @@ func TestEnterOnRelayOnlyBoxExplains(t *testing.T) {
 	v = vv.(boxesView)
 	vv, _ = v.Update(keyRunes('j'))
 	v = vv.(boxesView)
-	vv, cmd := v.Update(keyEnter())
-	v = vv.(boxesView)
-	if cmd != nil {
-		t.Fatalf("enter on a relay-only box must not emit a cmd, got %#v", cmd())
+	_, cmd := v.Update(keyEnter())
+	if cmd == nil {
+		t.Fatal("enter on a relay-only box should emit a switch")
 	}
-	if out := v.View(); !strings.Contains(out, "relay") {
-		t.Fatalf("view should explain the relay-only refusal:\n%s", out)
-	}
-	// The 2s poll reloads the box list; the note must survive it long enough
-	// to be read, not flash for under a tick.
-	vv, _ = v.Update(load)
-	v = vv.(boxesView)
-	if out := v.View(); !strings.Contains(out, "relay") {
-		t.Fatalf("note should survive a reload:\n%s", out)
-	}
-	// Moving the cursor dismisses it.
-	vv, _ = v.Update(keyRunes('k'))
-	v = vv.(boxesView)
-	if out := v.View(); strings.Contains(out, "relay") {
-		t.Fatalf("note should clear on cursor move:\n%s", out)
+	msg := cmd()
+	sw, ok := msg.(switchBoxMsg)
+	if !ok || sw.box.Name != "cloud.example" {
+		t.Fatalf("want switchBoxMsg for cloud.example, got %#v", msg)
 	}
 }
 
+func TestBoxesViewRefreshIncludesRelayAgentsAndUsesRelayLiveness(t *testing.T) {
+	relay := agentsServer(t, []relayclient.Agent{{BaseDomain: "cloud.example", Connected: true}})
+	defer relay.Close()
+	seedConfig(t, config.ClientFile{
+		Boxes:   []config.Box{{Name: "local", Addr: "192.168.1.6:8088", RelayAPI: relay.URL, AccountCredential: "cred-xyz"}},
+		Current: "local",
+	})
+
+	var dialed []string
+	dial := func(box config.Box) (API, string, bool, error) {
+		dialed = append(dialed, box.Name)
+		return fakeAPI{}, "", false, nil
+	}
+	v := newRelayBoxesView(t, dial, func(base string) RelayAPI { return relayclient.New(base) })
+	loaded, ok := v.refresh(nil)().(boxesLoadedMsg)
+	if !ok {
+		t.Fatal("refresh should yield boxesLoadedMsg")
+	}
+	vv, cmd := v.Update(loaded)
+	v = vv.(boxesView)
+	if cmd != nil {
+		_ = cmd()
+	}
+	if !strings.Contains(v.View(), "cloud.example") || !strings.Contains(v.View(), "●") {
+		t.Fatalf("connected relay agent should be listed as live:\n%s", v.View())
+	}
+	// A LAN probe result must not override the relay's connected field.
+	v.reach["cloud.example"] = false
+	if !strings.Contains(v.View(), "●") {
+		t.Fatalf("relay liveness should come from connected, not a LAN probe:\n%s", v.View())
+	}
+	for _, name := range dialed {
+		if name == "cloud.example" {
+			t.Fatal("relay-only row must not be probed through the LAN dialer")
+		}
+	}
+
+	vv, _ = v.Update(keyRunes('j'))
+	v = vv.(boxesView)
+	_, cmd = v.Update(keyEnter())
+	if cmd == nil {
+		t.Fatal("relay-only row should be switchable")
+	}
+	msg := cmd()
+	sw, ok := msg.(switchBoxMsg)
+	if !ok || sw.box.Name != "cloud.example" || sw.box.RelayAPI != relay.URL || sw.box.AccountCredential != "cred-xyz" {
+		t.Fatalf("relay row switch = %#v", msg)
+	}
+}
+
+func TestBoxesViewDeduplicatesRowsFromConfigAndRelay(t *testing.T) {
+	relay := agentsServer(t, []relayclient.Agent{{BaseDomain: "cloud.example", Connected: true}})
+	defer relay.Close()
+	seedConfig(t, config.ClientFile{
+		Boxes: []config.Box{
+			{Name: "account", Addr: "192.168.1.5:8088", RelayAPI: relay.URL, AccountCredential: "cred-xyz"},
+			{Name: "cloud.example", Addr: "192.168.1.6:8088"},
+		},
+		Current: "account",
+	})
+	v := newRelayBoxesView(t, fakeDialer(fakeAPI{}, "", false, nil), func(base string) RelayAPI { return relayclient.New(base) })
+	loaded, ok := v.refresh(nil)().(boxesLoadedMsg)
+	if !ok {
+		t.Fatal("refresh should yield boxesLoadedMsg")
+	}
+	vv, _ := v.Update(loaded)
+	v = vv.(boxesView)
+	if got := strings.Count(v.View(), "cloud.example"); got != 1 {
+		t.Fatalf("box present in config and /agents should render once, got %d rows:\n%s", got, v.View())
+	}
+	if !strings.Contains(v.View(), "●") {
+		t.Fatalf("deduplicated relay row should use relay liveness:\n%s", v.View())
+	}
+	for _, box := range v.boxes {
+		if box.Name == "cloud.example" {
+			if box.RelayAPI != relay.URL || box.AccountCredential != "cred-xyz" {
+				t.Fatalf("deduplicated row lost relay path: %+v", box)
+			}
+			return
+		}
+	}
+	t.Fatal("deduplicated relay row missing")
+}
+
 func TestBoxesRefreshProbesLANBoxWithRelayCreds(t *testing.T) {
-	// Only the current box and relay-only boxes are skipped: a LAN box with
-	// relay creds gets a reachability probe like any other LAN box.
+	// Without a live /agents entry, a LAN box carrying stale relay creds still
+	// gets a local reachability probe like any other LAN box.
 	v := newBoxesView(fakeDialer(fakeAPI{}, "", false, nil))
 	_, cmd := v.Update(boxesLoadedMsg{
 		boxes: []config.Box{

@@ -1,31 +1,36 @@
 package tui
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/piperbox/piper/internal/config"
+	"github.com/piperbox/piper/internal/relayclient"
 )
 
 // boxesView is the depth-1 box switcher/editor: a table of the configured boxes
-// read fresh from the client config. ↵ connects (switches the active box), a/e
-// add/edit via a form, x removes. It is the one view that owns local config
-// state rather than piperd state. Relay-only boxes (no LAN address) are listed
-// but not switchable.
+// read fresh from the client config and the account's live relay enrollment
+// list. ↵ connects (switches the active box), a/e add/edit via a form, x
+// removes. It is the one view that owns local config state rather than piperd
+// state.
 type boxesView struct {
 	dial    Dialer
+	relay   RelayDialer
 	boxes   []config.Box
 	current string
 	loaded  bool
 	cursor  int
 	err     error
-	notice  string          // why enter was refused; view-local (an errMsg cmd would banner the current box as down), survives reloads, cleared on cursor move
-	reach   map[string]bool // box name -> last probe result; absent = probing
+	reach   map[string]bool // box name -> last LAN probe result; absent = probing
+	// relayConnected is populated from the account's /agents listing for relay
+	// rows; those rows must never be probed through a LAN address.
+	relayConnected map[string]bool
 }
 
 func newBoxesView(dial Dialer) boxesView {
-	return boxesView{dial: dial, reach: map[string]bool{}}
+	return boxesView{dial: dial, reach: map[string]bool{}, relayConnected: map[string]bool{}}
 }
 
 func (v boxesView) Init() tea.Cmd { return nil }
@@ -36,22 +41,88 @@ func (v boxesView) footer() string {
 	return "↵ connect · a add · e edit · x remove · esc back"
 }
 
-// refresh reloads the client config off the UI thread.
+// refresh reloads the client config and account relay enrollment list off the
+// UI thread. A relay failure still leaves the saved local boxes usable and is
+// shown as a view error rather than changing the active box's reachability.
 func (v boxesView) refresh(API) tea.Cmd {
+	relay := v.relay
 	return func() tea.Msg {
 		cf, err := config.LoadClientFile()
 		if err != nil {
 			return errMsg{err}
 		}
-		return boxesLoadedMsg{boxes: cf.Boxes, current: cf.Current}
+		if relay == nil {
+			return boxesLoadedMsg{boxes: cf.Boxes, current: cf.Current}
+		}
+		cc, err := config.LoadClient()
+		if err != nil {
+			return boxesLoadedMsg{boxes: cf.Boxes, current: cf.Current, err: err}
+		}
+		if cc.RelayAPI == "" || cc.AccountCredential == "" {
+			return boxesLoadedMsg{boxes: cf.Boxes, current: cf.Current}
+		}
+		rc := relay(cc.RelayAPI)
+		if rc == nil {
+			return boxesLoadedMsg{boxes: cf.Boxes, current: cf.Current}
+		}
+		agents, err := rc.Agents(context.Background(), cc.AccountCredential)
+		if err != nil {
+			return boxesLoadedMsg{boxes: cf.Boxes, current: cf.Current, err: err}
+		}
+		boxes, connected := mergeBoxes(cf.Boxes, agents, cc.RelayAPI, cc.AccountCredential)
+		return boxesLoadedMsg{boxes: boxes, current: cf.Current, relayConnected: connected}
 	}
 }
 
+// mergeBoxes keeps saved LAN entries (including their names and addresses) and
+// appends live relay agents that are not already present. A matching local row
+// receives the relay credentials and liveness, so it remains one row and keeps
+// its LAN path as the preferred dial path.
+func mergeBoxes(local []config.Box, agents []relayclient.Agent, relayAPI, credential string) ([]config.Box, map[string]bool) {
+	boxes := make([]config.Box, 0, len(local)+len(agents))
+	byName := make(map[string]int, len(local)+len(agents))
+	for _, box := range local {
+		if _, exists := byName[box.Name]; exists {
+			continue
+		}
+		byName[box.Name] = len(boxes)
+		boxes = append(boxes, box)
+	}
+
+	connected := make(map[string]bool, len(agents))
+	for _, agent := range agents {
+		if agent.BaseDomain == "" {
+			continue
+		}
+		idx, exists := byName[agent.BaseDomain]
+		if exists {
+			boxes[idx].RelayAPI = relayAPI
+			boxes[idx].AccountCredential = credential
+			connected[boxes[idx].Name] = agent.Connected
+			continue
+		}
+		byName[agent.BaseDomain] = len(boxes)
+		boxes = append(boxes, config.Box{
+			Name:              agent.BaseDomain,
+			RelayAPI:          relayAPI,
+			AccountCredential: credential,
+		})
+		connected[agent.BaseDomain] = agent.Connected
+	}
+	return boxes, connected
+}
+
 // relayOnly reports whether the box at i is reachable only through the relay
-// (no LAN address, so not switchable here). A box with both a LAN address and
-// relay creds — a relay-enrolled box on the local network — is switchable.
+// (no LAN address). A box with both a LAN address and relay creds — a
+// relay-enrolled box on the local network — keeps its LAN path for switching;
+// when it is present in the live agent list, its status comes from the relay.
 func (v boxesView) relayOnly(i int) bool {
 	return v.boxes[i].RelayAPI != "" && v.boxes[i].Addr == ""
+}
+
+func (v boxesView) relayRow(name string) bool {
+	_, listed := v.relayConnected[name]
+	return listed
 }
 
 // probe returns a cmd that dials box and calls ListApps; reachable is true iff
@@ -70,14 +141,18 @@ func (v boxesView) probe(box config.Box) tea.Cmd {
 func (v boxesView) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case boxesLoadedMsg:
-		v.boxes, v.current, v.loaded, v.err = msg.boxes, msg.current, true, nil
+		v.boxes, v.current, v.loaded, v.err = msg.boxes, msg.current, true, msg.err
+		v.relayConnected = msg.relayConnected
+		if v.relayConnected == nil {
+			v.relayConnected = map[string]bool{}
+		}
 		v.reach = map[string]bool{}
 		if v.cursor >= len(v.boxes) {
 			v.cursor = max(0, len(v.boxes)-1)
 		}
 		var probes []tea.Cmd
 		for i, box := range v.boxes {
-			if box.Name == v.current || v.relayOnly(i) {
+			if box.Name == v.current || v.relayRow(box.Name) || v.relayOnly(i) {
 				continue
 			}
 			probes = append(probes, v.probe(box))
@@ -90,22 +165,16 @@ func (v boxesView) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "up", "k":
-			v.notice = ""
 			if v.cursor > 0 {
 				v.cursor--
 			}
 		case "down", "j":
-			v.notice = ""
 			if v.cursor < len(v.boxes)-1 {
 				v.cursor++
 			}
 		case "enter":
 			if len(v.boxes) == 0 {
 				break
-			}
-			if v.relayOnly(v.cursor) {
-				v.notice = fmt.Sprintf("%s has no LAN address: relay boxes are driven with `piper --remote <domain>`", v.boxes[v.cursor].Name)
-				return v, nil
 			}
 			box := v.boxes[v.cursor]
 			return v, func() tea.Msg { return switchBoxMsg{box: box} }
@@ -144,9 +213,6 @@ func (v boxesView) View() string {
 		}
 		fmt.Fprintf(&b, "%s%-16s %-22s %s\n", cursor, box.Name, box.Addr, v.status(i))
 	}
-	if v.notice != "" {
-		fmt.Fprintf(&b, "\n ⚠ %s\n", v.notice)
-	}
 	return b.String()
 }
 
@@ -154,6 +220,11 @@ func (v boxesView) status(i int) string {
 	switch {
 	case v.boxes[i].Name == v.current:
 		return "current"
+	case v.relayRow(v.boxes[i].Name):
+		if v.relayConnected[v.boxes[i].Name] {
+			return "●"
+		}
+		return "○"
 	case v.relayOnly(i):
 		return "—"
 	}

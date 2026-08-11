@@ -36,8 +36,8 @@ type API interface {
 }
 
 // Dialer builds a client for a saved box. cmd/piper supplies the real one
-// (LAN path); tests inject a fake. addr identifies the box in the status bar;
-// remote marks a relay-backed box (HTTPS app URLs).
+// (LAN or relay path); tests inject a fake. addr identifies the box in the
+// status bar; remote marks a relay-backed box (HTTPS app URLs).
 type Dialer func(config.Box) (c API, addr string, remote bool, err error)
 
 // RelayAPI is the slice of the relay control API the TUI consumes.
@@ -47,10 +47,12 @@ type RelayAPI interface {
 	CLILoginPoll(ctx context.Context, handle string) (relayclient.Account, error)
 	GitHubStatus(ctx context.Context, cred string) (relayclient.Status, error)
 	GitHubRepos(ctx context.Context, cred, installationID string) ([]relayclient.Repo, error)
+	Agents(ctx context.Context, cred string) ([]relayclient.Agent, error)
 }
 
 // RelayDialer builds a relay client for a base URL. cmd/piper supplies the
-// real one; tests inject fakes. A factory, not a client: a fresh user logs in
+// real one; tests inject fakes. The boxes view, GitHub wizard, and repo picker
+// all use the factory. It is a factory, not a client: a fresh user logs in
 // against the default relay, a configured user against their saved RelayAPI.
 type RelayDialer func(base string) RelayAPI
 
@@ -89,11 +91,12 @@ type (
 	}
 
 	// boxesLoadedMsg carries the client config the boxes view renders. It is a
-	// local-config load, not a piperd poll, so it does not implement pollResult
-	// (the status bar keeps its last-known reachability while browsing boxes).
+	// local-config load plus the account's live relay enrollment list.
 	boxesLoadedMsg struct {
-		boxes   []config.Box
-		current string
+		boxes          []config.Box
+		current        string
+		relayConnected map[string]bool
+		err            error
 	}
 
 	// switchBoxMsg is the boxes view's connect intent; the root dials the box,
