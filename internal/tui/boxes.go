@@ -123,10 +123,9 @@ func mergeBoxes(local []config.Box, agents []relayclient.Agent, relayAPI, creden
 	return boxes, connected
 }
 
-// relayOnly reports whether the box at i is reachable only through the relay
-// (no LAN address). A box with both a LAN address and relay creds — a
-// relay-enrolled box on the local network — keeps its LAN path for switching;
-// when it is present in the live agent list, its status comes from the relay.
+// relayOnly reports whether the box at i has no LAN path. LAN-addressable rows
+// keep their LAN switch/probe path even when relay credentials are present;
+// relay-only rows use the live relay status when listed.
 func (v boxesView) relayOnly(i int) bool {
 	return v.boxes[i].RelayAPI != "" && v.boxes[i].Addr == ""
 }
