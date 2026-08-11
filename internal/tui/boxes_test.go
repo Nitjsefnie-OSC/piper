@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -197,9 +198,11 @@ func TestBoxesViewRefreshIncludesRelayAgentsAndUsesRelayLiveness(t *testing.T) {
 	}
 	vv, cmd := v.Update(loaded)
 	v = vv.(boxesView)
-	if cmd != nil {
-		_ = cmd()
+	if cmd == nil {
+		t.Fatal("local rows should schedule the relay fetch")
 	}
+	vv, _ = v.Update(cmd())
+	v = vv.(boxesView)
 	if !strings.Contains(v.View(), "cloud.example") || !strings.Contains(v.View(), "●") {
 		t.Fatalf("connected relay agent should be listed as live:\n%s", v.View())
 	}
@@ -233,7 +236,7 @@ func TestBoxesViewDeduplicatesRowsFromConfigAndRelay(t *testing.T) {
 	seedConfig(t, config.ClientFile{
 		Boxes: []config.Box{
 			{Name: "account", Addr: "192.168.1.5:8088", RelayAPI: relay.URL, AccountCredential: "cred-xyz"},
-			{Name: "cloud.example", Addr: "192.168.1.6:8088"},
+			{Name: "cloud.example", RelayAPI: relay.URL, AccountCredential: "cred-xyz"},
 		},
 		Current: "account",
 	})
@@ -242,7 +245,12 @@ func TestBoxesViewDeduplicatesRowsFromConfigAndRelay(t *testing.T) {
 	if !ok {
 		t.Fatal("refresh should yield boxesLoadedMsg")
 	}
-	vv, _ := v.Update(loaded)
+	vv, cmd := v.Update(loaded)
+	v = vv.(boxesView)
+	if cmd == nil {
+		t.Fatal("local rows should schedule the relay fetch")
+	}
+	vv, _ = v.Update(cmd())
 	v = vv.(boxesView)
 	if got := strings.Count(v.View(), "cloud.example"); got != 1 {
 		t.Fatalf("box present in config and /agents should render once, got %d rows:\n%s", got, v.View())
@@ -259,6 +267,125 @@ func TestBoxesViewDeduplicatesRowsFromConfigAndRelay(t *testing.T) {
 		}
 	}
 	t.Fatal("deduplicated relay row missing")
+}
+
+func TestBoxesViewDeduplicatedLANRowUsesLANLiveness(t *testing.T) {
+	relay := agentsServer(t, []relayclient.Agent{{BaseDomain: "cloud.example", Connected: false}})
+	defer relay.Close()
+	seedConfig(t, config.ClientFile{
+		Boxes: []config.Box{
+			{Name: "account", Addr: "192.168.1.5:8088", RelayAPI: relay.URL, AccountCredential: "cred-xyz"},
+			{Name: "cloud.example", Addr: "192.168.1.6:8088"},
+		},
+		Current: "account",
+	})
+
+	var dialed []string
+	dial := func(box config.Box) (API, string, bool, error) {
+		dialed = append(dialed, box.Name)
+		return fakeAPI{}, box.Addr, false, nil
+	}
+	v := newRelayBoxesView(t, dial, func(base string) RelayAPI { return relayclient.New(base) })
+	loaded, ok := v.refresh(nil)().(boxesLoadedMsg)
+	if !ok {
+		t.Fatal("refresh should yield boxesLoadedMsg")
+	}
+	vv, cmd := v.Update(loaded)
+	v = vv.(boxesView)
+	if cmd == nil {
+		t.Fatal("deduplicated LAN row should emit a LAN probe")
+	}
+	result := cmd()
+	var relayMsg relayAgentsLoadedMsg
+	var probe boxProbeMsg
+	switch result := result.(type) {
+	case tea.BatchMsg:
+		for _, subcmd := range result {
+			switch msg := subcmd().(type) {
+			case relayAgentsLoadedMsg:
+				relayMsg = msg
+			case boxProbeMsg:
+				probe = msg
+			}
+		}
+	case boxProbeMsg:
+		probe = result
+	case relayAgentsLoadedMsg:
+		relayMsg = result
+	}
+	if relayMsg.relayAPI != "" {
+		vv, _ = v.Update(relayMsg)
+		v = vv.(boxesView)
+	}
+	if probe.name != "cloud.example" || !probe.reachable {
+		t.Fatalf("want reachable cloud.example LAN probe, got %#v", probe)
+	}
+	if len(dialed) != 1 || dialed[0] != "cloud.example" {
+		t.Fatalf("LAN probe dialed %v, want [cloud.example]", dialed)
+	}
+	vv, _ = v.Update(probe)
+	v = vv.(boxesView)
+	if !strings.Contains(v.View(), "cloud.example") || !strings.Contains(v.View(), "●") {
+		t.Fatalf("deduplicated LAN row should use LAN liveness when relay is disconnected:\n%s", v.View())
+	}
+}
+
+type blockingAgentsRelay struct {
+	fakeRelay
+	started chan<- struct{}
+	release <-chan struct{}
+}
+
+func (r blockingAgentsRelay) Agents(context.Context, string) ([]relayclient.Agent, error) {
+	close(r.started)
+	<-r.release
+	return r.fakeRelay.agents, r.fakeRelay.agentsErr
+}
+
+func TestBoxesRefreshRendersLocalRowsBeforeRelayReturns(t *testing.T) {
+	seedConfig(t, config.ClientFile{
+		Boxes:   []config.Box{{Name: "local", Addr: "192.168.1.6:8088", RelayAPI: "https://relay.example", AccountCredential: "cred-xyz"}},
+		Current: "local",
+	})
+	started := make(chan struct{})
+	release := make(chan struct{})
+	relay := blockingAgentsRelay{
+		fakeRelay: fakeRelay{agents: []relayclient.Agent{{BaseDomain: "cloud.example", Connected: true}}},
+		started:   started,
+		release:   release,
+	}
+	v := newRelayBoxesView(t, fakeDialer(fakeAPI{}, "", false, nil), func(string) RelayAPI { return relay })
+
+	result := make(chan tea.Msg, 1)
+	go func() { result <- v.refresh(nil)() }()
+	select {
+	case msg := <-result:
+		loaded, ok := msg.(boxesLoadedMsg)
+		if !ok {
+			t.Fatalf("refresh should yield local boxesLoadedMsg, got %T", msg)
+		}
+		vv, relayCmd := v.Update(loaded)
+		v = vv.(boxesView)
+		if relayCmd == nil {
+			t.Fatal("loaded local rows should schedule the relay fetch")
+		}
+		relayResult := make(chan tea.Msg, 1)
+		go func() { relayResult <- relayCmd() }()
+		<-started
+		if !strings.Contains(v.View(), "local") || strings.Contains(v.View(), "loading") {
+			t.Fatalf("local rows should render before relay returns:\n%s", v.View())
+		}
+		close(release)
+		vv, _ = v.Update(<-relayResult)
+		v = vv.(boxesView)
+		if !strings.Contains(v.View(), "cloud.example") {
+			t.Fatalf("relay row should arrive after the controlled release:\n%s", v.View())
+		}
+	case <-started:
+		close(release)
+		msg := <-result
+		t.Fatalf("refresh waited for relay before returning local rows; got %T after release", msg)
+	}
 }
 
 func TestBoxesRefreshProbesLANBoxWithRelayCreds(t *testing.T) {

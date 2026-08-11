@@ -91,12 +91,24 @@ type (
 	}
 
 	// boxesLoadedMsg carries the client config the boxes view renders. It is a
-	// local-config load plus the account's live relay enrollment list.
+	// local-config load. fetchRelay asks the view to fetch the account's live
+	// relay enrollment list independently, after the local rows are rendered.
 	boxesLoadedMsg struct {
 		boxes          []config.Box
 		current        string
 		relayConnected map[string]bool
 		err            error
+		fetchRelay     bool
+	}
+
+	// relayAgentsLoadedMsg carries the optional relay enrollment result. It is
+	// deliberately separate from boxesLoadedMsg so a slow relay cannot delay
+	// the local-config rows.
+	relayAgentsLoadedMsg struct {
+		agents     []relayclient.Agent
+		relayAPI   string
+		credential string
+		err        error
 	}
 
 	// switchBoxMsg is the boxes view's connect intent; the root dials the box,

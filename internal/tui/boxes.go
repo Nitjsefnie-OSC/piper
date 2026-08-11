@@ -41,9 +41,9 @@ func (v boxesView) footer() string {
 	return "↵ connect · a add · e edit · x remove · esc back"
 }
 
-// refresh reloads the client config and account relay enrollment list off the
-// UI thread. A relay failure still leaves the saved local boxes usable and is
-// shown as a view error rather than changing the active box's reachability.
+// refresh reloads the client config off the UI thread. The optional relay
+// enrollment fetch is scheduled after this local result is rendered, so a slow
+// relay cannot hold the saved LAN rows in loading state.
 func (v boxesView) refresh(API) tea.Cmd {
 	relay := v.relay
 	return func() tea.Msg {
@@ -51,33 +51,44 @@ func (v boxesView) refresh(API) tea.Cmd {
 		if err != nil {
 			return errMsg{err}
 		}
+		return boxesLoadedMsg{boxes: cf.Boxes, current: cf.Current, fetchRelay: relay != nil}
+	}
+}
+
+// fetchRelay loads the current account's relay enrollment list off the UI
+// thread. Local rows are already visible by the time this command runs; a
+// relay failure is shown as a view error without removing those rows.
+func (v boxesView) fetchRelay() tea.Cmd {
+	relay := v.relay
+	return func() tea.Msg {
 		if relay == nil {
-			return boxesLoadedMsg{boxes: cf.Boxes, current: cf.Current}
+			return relayAgentsLoadedMsg{}
 		}
 		cc, err := config.LoadClient()
 		if err != nil {
-			return boxesLoadedMsg{boxes: cf.Boxes, current: cf.Current, err: err}
+			return relayAgentsLoadedMsg{err: err}
 		}
 		if cc.RelayAPI == "" || cc.AccountCredential == "" {
-			return boxesLoadedMsg{boxes: cf.Boxes, current: cf.Current}
+			return relayAgentsLoadedMsg{}
 		}
 		rc := relay(cc.RelayAPI)
 		if rc == nil {
-			return boxesLoadedMsg{boxes: cf.Boxes, current: cf.Current}
+			return relayAgentsLoadedMsg{}
 		}
 		agents, err := rc.Agents(context.Background(), cc.AccountCredential)
-		if err != nil {
-			return boxesLoadedMsg{boxes: cf.Boxes, current: cf.Current, err: err}
+		return relayAgentsLoadedMsg{
+			agents:     agents,
+			relayAPI:   cc.RelayAPI,
+			credential: cc.AccountCredential,
+			err:        err,
 		}
-		boxes, connected := mergeBoxes(cf.Boxes, agents, cc.RelayAPI, cc.AccountCredential)
-		return boxesLoadedMsg{boxes: boxes, current: cf.Current, relayConnected: connected}
 	}
 }
 
 // mergeBoxes keeps saved LAN entries (including their names and addresses) and
 // appends live relay agents that are not already present. A matching local row
-// receives the relay credentials and liveness, so it remains one row and keeps
-// its LAN path as the preferred dial path.
+// receives the relay credentials, so it remains one row and keeps its LAN path
+// as the preferred dial path. Relay liveness is used only by relay-only rows.
 func mergeBoxes(local []config.Box, agents []relayclient.Agent, relayAPI, credential string) ([]config.Box, map[string]bool) {
 	boxes := make([]config.Box, 0, len(local)+len(agents))
 	byName := make(map[string]int, len(local)+len(agents))
@@ -150,14 +161,30 @@ func (v boxesView) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if v.cursor >= len(v.boxes) {
 			v.cursor = max(0, len(v.boxes)-1)
 		}
-		var probes []tea.Cmd
+		var cmds []tea.Cmd
+		if msg.fetchRelay {
+			cmds = append(cmds, v.fetchRelay())
+		}
 		for i, box := range v.boxes {
-			if box.Name == v.current || v.relayRow(box.Name) || v.relayOnly(i) {
+			if box.Name == v.current || v.relayOnly(i) {
 				continue
 			}
-			probes = append(probes, v.probe(box))
+			cmds = append(cmds, v.probe(box))
 		}
-		return v, tea.Batch(probes...)
+		return v, tea.Batch(cmds...)
+	case relayAgentsLoadedMsg:
+		if msg.err != nil {
+			v.err = msg.err
+			return v, nil
+		}
+		if msg.relayAPI == "" {
+			return v, nil
+		}
+		v.boxes, v.relayConnected = mergeBoxes(v.boxes, msg.agents, msg.relayAPI, msg.credential)
+		if v.cursor >= len(v.boxes) {
+			v.cursor = max(0, len(v.boxes)-1)
+		}
+		return v, nil
 	case boxProbeMsg:
 		v.reach[msg.name] = msg.reachable
 	case errMsg:
@@ -220,12 +247,13 @@ func (v boxesView) status(i int) string {
 	switch {
 	case v.boxes[i].Name == v.current:
 		return "current"
-	case v.relayRow(v.boxes[i].Name):
-		if v.relayConnected[v.boxes[i].Name] {
-			return "●"
-		}
-		return "○"
 	case v.relayOnly(i):
+		if v.relayRow(v.boxes[i].Name) {
+			if v.relayConnected[v.boxes[i].Name] {
+				return "●"
+			}
+			return "○"
+		}
 		return "—"
 	}
 	reachable, probed := v.reach[v.boxes[i].Name]
