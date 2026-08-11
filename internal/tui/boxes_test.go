@@ -236,7 +236,7 @@ func TestBoxesViewDeduplicatesRowsFromConfigAndRelay(t *testing.T) {
 	seedConfig(t, config.ClientFile{
 		Boxes: []config.Box{
 			{Name: "account", Addr: "192.168.1.5:8088", RelayAPI: relay.URL, AccountCredential: "cred-xyz"},
-			{Name: "cloud.example", RelayAPI: relay.URL, AccountCredential: "cred-xyz"},
+			{Name: "cloud.example", Addr: "192.168.1.6:8088"},
 		},
 		Current: "account",
 	})
@@ -250,8 +250,31 @@ func TestBoxesViewDeduplicatesRowsFromConfigAndRelay(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("local rows should schedule the relay fetch")
 	}
-	vv, _ = v.Update(cmd())
-	v = vv.(boxesView)
+	var relayMsg relayAgentsLoadedMsg
+	var probe boxProbeMsg
+	switch result := cmd().(type) {
+	case tea.BatchMsg:
+		for _, subcmd := range result {
+			switch msg := subcmd().(type) {
+			case relayAgentsLoadedMsg:
+				relayMsg = msg
+			case boxProbeMsg:
+				probe = msg
+			}
+		}
+	case relayAgentsLoadedMsg:
+		relayMsg = result
+	case boxProbeMsg:
+		probe = result
+	}
+	if relayMsg.relayAPI != "" {
+		vv, _ = v.Update(relayMsg)
+		v = vv.(boxesView)
+	}
+	if probe.name != "" {
+		vv, _ = v.Update(probe)
+		v = vv.(boxesView)
+	}
 	if got := strings.Count(v.View(), "cloud.example"); got != 1 {
 		t.Fatalf("box present in config and /agents should render once, got %d rows:\n%s", got, v.View())
 	}
