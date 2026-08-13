@@ -286,26 +286,28 @@ func migrateLegacyBoxes(local []config.Box, agents []relayclient.Agent, identiti
 }
 
 func persistLegacyIdentities(expectedHash, relayAPI, credential string, agents []relayclient.Agent, identities map[string]string) (config.ClientFile, bool, error) {
-	cf, err := config.LoadClientFile()
-	if err != nil {
-		return config.ClientFile{}, false, err
-	}
-	currentAPI, currentCredential := relayCredentials(cf)
-	if currentAPI != relayAPI || currentCredential != credential {
-		return cf, false, nil
-	}
-	if expectedHash != "" && relayCredentialHash(cf) != expectedHash {
-		return cf, false, nil
-	}
-	migrated, changed := migrateLegacyBoxes(cf.Boxes, agents, identities)
-	if !changed {
-		return cf, true, nil
-	}
-	cf.Boxes = migrated
-	if err := config.SaveClientFile(cf); err != nil {
-		return cf, true, err
-	}
-	return cf, true, nil
+	var current config.ClientFile
+	accepted := false
+	err := config.UpdateClientFile(func(cf *config.ClientFile) (bool, error) {
+		current = *cf
+		currentAPI, currentCredential := relayCredentials(*cf)
+		if currentAPI != relayAPI || currentCredential != credential {
+			return false, nil
+		}
+		if expectedHash != "" && relayCredentialHash(*cf) != expectedHash {
+			return false, nil
+		}
+		migrated, changed := migrateLegacyBoxes(cf.Boxes, agents, identities)
+		if !changed {
+			accepted = true
+			return false, nil
+		}
+		cf.Boxes = migrated
+		current = *cf
+		accepted = true
+		return true, nil
+	})
+	return current, accepted, err
 }
 
 // relayOnly reports whether the box at i has no LAN path. LAN-addressable rows
@@ -576,49 +578,46 @@ func (v boxesView) status(i int) string {
 // (whose name may change), else appends box. All other boxes are preserved; a
 // first box (empty config) becomes current. replacing == "" means add.
 func saveBox(box config.Box, replacing string) error {
-	cf, err := config.LoadClientFile()
-	if err != nil {
-		return err
-	}
-	if replacing != "" {
-		for i := range cf.Boxes {
-			if cf.Boxes[i].Name == replacing {
-				if cf.Current == replacing {
-					cf.Current = box.Name
+	return config.UpdateClientFile(func(cf *config.ClientFile) (bool, error) {
+		if replacing != "" {
+			for i := range cf.Boxes {
+				if cf.Boxes[i].Name == replacing {
+					if cf.Current == replacing {
+						cf.Current = box.Name
+					}
+					cf.Boxes[i] = box
+					return true, nil
 				}
-				cf.Boxes[i] = box
-				return config.SaveClientFile(cf)
 			}
 		}
-	}
-	cf.Boxes = append(cf.Boxes, box)
-	if cf.Current == "" {
-		cf.Current = box.Name
-	}
-	return config.SaveClientFile(cf)
+		cf.Boxes = append(cf.Boxes, box)
+		if cf.Current == "" {
+			cf.Current = box.Name
+		}
+		return true, nil
+	})
 }
 
 // removeBox drops the box named name from the client config. If it was the
 // current box, the first remaining box is promoted and returned with
 // changed=true. Removing the last box is refused (the CLI always needs one).
 func removeBox(name string) (current config.Box, changed bool, err error) {
-	cf, err := config.LoadClientFile()
-	if err != nil {
-		return config.Box{}, false, err
-	}
-	if len(cf.Boxes) <= 1 {
-		return config.Box{}, false, fmt.Errorf("can't remove the last box")
-	}
-	kept := cf.Boxes[:0]
-	for _, b := range cf.Boxes {
-		if b.Name != name {
-			kept = append(kept, b)
+	err = config.UpdateClientFile(func(cf *config.ClientFile) (bool, error) {
+		if len(cf.Boxes) <= 1 {
+			return false, fmt.Errorf("can't remove the last box")
 		}
-	}
-	cf.Boxes = kept
-	if cf.Current == name {
-		cf.Current = cf.Boxes[0].Name
-		current, changed = cf.Boxes[0], true
-	}
-	return current, changed, config.SaveClientFile(cf)
+		kept := cf.Boxes[:0]
+		for _, b := range cf.Boxes {
+			if b.Name != name {
+				kept = append(kept, b)
+			}
+		}
+		cf.Boxes = kept
+		if cf.Current == name {
+			cf.Current = cf.Boxes[0].Name
+			current, changed = cf.Boxes[0], true
+		}
+		return true, nil
+	})
+	return current, changed, err
 }

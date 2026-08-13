@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 )
 
 type Config struct {
@@ -198,11 +199,15 @@ func (cf ClientFile) CurrentBox() (Box, bool) {
 // LoadClientFile reads ~/.piper/piper/config.json. A missing file is not an
 // error.
 func LoadClientFile() (ClientFile, error) {
-	var cf ClientFile
 	path, err := clientConfigPath()
 	if err != nil {
-		return cf, err
+		return ClientFile{}, err
 	}
+	return loadClientFile(path)
+}
+
+func loadClientFile(path string) (ClientFile, error) {
+	var cf ClientFile
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return cf, nil
@@ -219,16 +224,54 @@ func LoadClientFile() (ClientFile, error) {
 
 // SaveClientFile writes cf to ~/.piper/piper/config.json with 0600 perms,
 // creating the directory if needed. The write is atomic: bytes are staged to a
-// temp file in the same directory, fsync'd, and renamed over the real path so a
-// crash mid-write cannot leave the config truncated or half-written.
+// temp file in the same directory, fsync'd, and renamed over the real path so
+// a crash mid-write cannot leave the config truncated or half-written. The
+// config directory lock serializes this replacement with every writer using
+// the client-config API, including read-modify-write transactions.
 func SaveClientFile(cf ClientFile) error {
+	return withClientConfigLock(func(path string) error { return saveClientFile(path, cf) })
+}
+
+// UpdateClientFile runs update against the current client config while holding
+// the cross-process config-directory lock. Returning changed=false skips the
+// write, which lets conditional updates reject a stale snapshot without
+// touching the file.
+func UpdateClientFile(update func(*ClientFile) (changed bool, err error)) error {
+	return withClientConfigLock(func(path string) error {
+		cf, err := loadClientFile(path)
+		if err != nil {
+			return err
+		}
+		changed, err := update(&cf)
+		if err != nil || !changed {
+			return err
+		}
+		return saveClientFile(path, cf)
+	})
+}
+
+func withClientConfigLock(fn func(path string) error) error {
 	path, err := clientConfigPath()
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
+	lock, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+		return err
+	}
+	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+	return fn(path)
+}
+
+func saveClientFile(path string, cf ClientFile) error {
 	data, err := json.MarshalIndent(cf, "", "  ")
 	if err != nil {
 		return err
@@ -315,41 +358,39 @@ func LoadClient() (ClientConfig, error) {
 // SaveClient writes cc into the current box of ~/.piper/piper/config.json
 // (creating a "default" box if none exists), preserving all other boxes.
 func SaveClient(cc ClientConfig) error {
-	cf, err := LoadClientFile()
-	if err != nil {
-		return err
-	}
-	name := cf.Current
-	if name == "" {
-		name = "default"
-	}
-	if b, ok := cf.CurrentBox(); ok {
-		name = b.Name
-	}
-	updated := false
-	for i := range cf.Boxes {
-		if cf.Boxes[i].Name == name {
-			cf.Boxes[i].Addr = cc.Addr
-			cf.Boxes[i].Token = cc.Token
-			cf.Boxes[i].BaseDomain = cc.BaseDomain
-			cf.Boxes[i].RelayAPI = cc.RelayAPI
-			cf.Boxes[i].AccountCredential = cc.AccountCredential
-			updated = true
-			break
+	return UpdateClientFile(func(cf *ClientFile) (bool, error) {
+		name := cf.Current
+		if name == "" {
+			name = "default"
 		}
-	}
-	if !updated {
-		cf.Boxes = append(cf.Boxes, Box{
-			Name:              name,
-			Addr:              cc.Addr,
-			Token:             cc.Token,
-			BaseDomain:        cc.BaseDomain,
-			RelayAPI:          cc.RelayAPI,
-			AccountCredential: cc.AccountCredential,
-		})
-	}
-	cf.Current = name
-	return SaveClientFile(cf)
+		if b, ok := cf.CurrentBox(); ok {
+			name = b.Name
+		}
+		updated := false
+		for i := range cf.Boxes {
+			if cf.Boxes[i].Name == name {
+				cf.Boxes[i].Addr = cc.Addr
+				cf.Boxes[i].Token = cc.Token
+				cf.Boxes[i].BaseDomain = cc.BaseDomain
+				cf.Boxes[i].RelayAPI = cc.RelayAPI
+				cf.Boxes[i].AccountCredential = cc.AccountCredential
+				updated = true
+				break
+			}
+		}
+		if !updated {
+			cf.Boxes = append(cf.Boxes, Box{
+				Name:              name,
+				Addr:              cc.Addr,
+				Token:             cc.Token,
+				BaseDomain:        cc.BaseDomain,
+				RelayAPI:          cc.RelayAPI,
+				AccountCredential: cc.AccountCredential,
+			})
+		}
+		cf.Current = name
+		return true, nil
+	})
 }
 
 // SaveCurrentBoxBaseDomain records the relay's stable identity on the
@@ -359,25 +400,23 @@ func SaveCurrentBoxBaseDomain(baseDomain string) error {
 	if strings.TrimSpace(baseDomain) == "" {
 		return nil
 	}
-	cf, err := LoadClientFile()
-	if err != nil {
-		return err
-	}
-	if len(cf.Boxes) == 0 {
-		return nil
-	}
-	idx := 0
-	for i, box := range cf.Boxes {
-		if box.Name == cf.Current {
-			idx = i
-			break
+	return UpdateClientFile(func(cf *ClientFile) (bool, error) {
+		if len(cf.Boxes) == 0 {
+			return false, nil
 		}
-	}
-	cf.Boxes[idx].BaseDomain = strings.TrimSpace(baseDomain)
-	if cf.Current == "" {
-		cf.Current = cf.Boxes[idx].Name
-	}
-	return SaveClientFile(cf)
+		idx := 0
+		for i, box := range cf.Boxes {
+			if box.Name == cf.Current {
+				idx = i
+				break
+			}
+		}
+		cf.Boxes[idx].BaseDomain = strings.TrimSpace(baseDomain)
+		if cf.Current == "" {
+			cf.Current = cf.Boxes[idx].Name
+		}
+		return true, nil
+	})
 }
 
 // RelayFile is the persisted relay enrollment written by piperd (applying a
