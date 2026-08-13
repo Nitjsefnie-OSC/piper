@@ -742,6 +742,21 @@ func TestRelayLoginRunsClaimStage(t *testing.T) {
 	if got.RelayAPI != relay.URL || got.AccountCredential != "cred-xyz" {
 		t.Fatalf("claim did not carry the fresh credential: %+v", got)
 	}
+	cf, err := config.LoadClientFile()
+	if err != nil || len(cf.Boxes) != 1 {
+		t.Fatalf("saved client config = %+v (%v)", cf, err)
+	}
+	identity, err := json.Marshal(cf.Boxes[0])
+	if err != nil {
+		t.Fatalf("marshal saved box: %v", err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(identity, &raw); err != nil {
+		t.Fatalf("decode saved box: %v", err)
+	}
+	if got, _ := raw["base_domain"].(string); got != "ab12-erin.public.getpiper.co" {
+		t.Fatalf("saved agent identity = %q, want ab12-erin.public.getpiper.co", got)
+	}
 	for _, want := range []string{"logged in to relay as erin", "claiming this box", "ab12-erin.public.getpiper.co"} {
 		if !strings.Contains(out.String(), want) {
 			t.Fatalf("stdout missing %q:\n%s", want, out.String())

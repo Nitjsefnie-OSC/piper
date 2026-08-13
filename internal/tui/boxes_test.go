@@ -29,6 +29,65 @@ func fakeDialer(c API, addr string, remote bool, err error) Dialer {
 	return func(config.Box) (API, string, bool, error) { return c, addr, remote, err }
 }
 
+// boxWithBaseDomain adds the persisted agent identity through the JSON shape
+// so this regression remains an assertion failure before config.Box grows the
+// field that stores it.
+func boxWithBaseDomain(t *testing.T, box config.Box, baseDomain string) config.Box {
+	t.Helper()
+	data, err := json.Marshal(box)
+	if err != nil {
+		t.Fatalf("marshal box: %v", err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("decode box: %v", err)
+	}
+	raw["base_domain"] = baseDomain
+	data, err = json.Marshal(raw)
+	if err != nil {
+		t.Fatalf("marshal box with identity: %v", err)
+	}
+	var got config.Box
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("decode box with identity: %v", err)
+	}
+	return got
+}
+
+func persistedBaseDomain(t *testing.T, box config.Box) string {
+	t.Helper()
+	data, err := json.Marshal(box)
+	if err != nil {
+		t.Fatalf("marshal box: %v", err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("decode box: %v", err)
+	}
+	baseDomain, _ := raw["base_domain"].(string)
+	return baseDomain
+}
+
+func commandMessages(cmd tea.Cmd) []tea.Msg {
+	if cmd == nil {
+		return nil
+	}
+	msg := cmd()
+	if batch, ok := msg.(tea.BatchMsg); ok {
+		messages := make([]tea.Msg, 0, len(batch))
+		for _, subcmd := range batch {
+			if submsg := subcmd(); submsg != nil {
+				messages = append(messages, submsg)
+			}
+		}
+		return messages
+	}
+	if msg == nil {
+		return nil
+	}
+	return []tea.Msg{msg}
+}
+
 // newRelayBoxesView uses the same root wiring as the product: the root injects
 // its relay factory when it pushes the boxes view.
 func newRelayBoxesView(t *testing.T, dial Dialer, relay RelayDialer) boxesView {
@@ -236,7 +295,7 @@ func TestBoxesViewDeduplicatesRowsFromConfigAndRelay(t *testing.T) {
 	seedConfig(t, config.ClientFile{
 		Boxes: []config.Box{
 			{Name: "account", Addr: "192.168.1.5:8088", RelayAPI: relay.URL, AccountCredential: "cred-xyz"},
-			{Name: "cloud.example", Addr: "192.168.1.6:8088"},
+			boxWithBaseDomain(t, config.Box{Name: "cloud.example", Addr: "192.168.1.6:8088"}, "cloud.example"),
 		},
 		Current: "account",
 	})
@@ -298,7 +357,7 @@ func TestBoxesViewDeduplicatedLANRowUsesLANLiveness(t *testing.T) {
 	seedConfig(t, config.ClientFile{
 		Boxes: []config.Box{
 			{Name: "account", Addr: "192.168.1.5:8088", RelayAPI: relay.URL, AccountCredential: "cred-xyz"},
-			{Name: "cloud.example", Addr: "192.168.1.6:8088"},
+			boxWithBaseDomain(t, config.Box{Name: "cloud.example", Addr: "192.168.1.6:8088"}, "cloud.example"),
 		},
 		Current: "account",
 	})
@@ -350,6 +409,157 @@ func TestBoxesViewDeduplicatedLANRowUsesLANLiveness(t *testing.T) {
 	v = vv.(boxesView)
 	if !strings.Contains(v.View(), "cloud.example") || !strings.Contains(v.View(), "●") {
 		t.Fatalf("deduplicated LAN row should use LAN liveness when relay is disconnected:\n%s", v.View())
+	}
+}
+
+func TestBoxesViewDeduplicatesByPersistedAgentIdentity(t *testing.T) {
+	base := "cloud.example"
+	local := boxWithBaseDomain(t, config.Box{Name: "living-room", Addr: "192.168.1.6:8088"}, base)
+	v := newBoxesView(fakeDialer(fakeAPI{}, "", false, nil))
+	vv, _ := v.Update(boxesLoadedMsg{
+		boxes:   []config.Box{local},
+		current: "living-room",
+	})
+	v = vv.(boxesView)
+	vv, _ = v.Update(relayAgentsLoadedMsg{
+		agents:     []relayclient.Agent{{BaseDomain: base, Connected: true}},
+		relayAPI:   "https://relay.example",
+		credential: "cred-xyz",
+	})
+	v = vv.(boxesView)
+	if len(v.boxes) != 1 || v.boxes[0].Name != "living-room" {
+		t.Fatalf("persisted identity should merge the LAN row, got %+v", v.boxes)
+	}
+	if got := persistedBaseDomain(t, v.boxes[0]); got != base {
+		t.Fatalf("merged row lost agent identity: %+v", v.boxes[0])
+	}
+}
+
+func TestBoxesViewKeepsMergedRowsAcrossLocalRefresh(t *testing.T) {
+	base := "cloud.example"
+	local := []config.Box{{Name: "local", Addr: "192.168.1.6:8088"}}
+	v := newBoxesView(fakeDialer(fakeAPI{}, "", false, nil))
+	vv, _ := v.Update(boxesLoadedMsg{boxes: local, current: "local"})
+	v = vv.(boxesView)
+	vv, _ = v.Update(relayAgentsLoadedMsg{
+		agents:     []relayclient.Agent{{BaseDomain: base, Connected: true}},
+		relayAPI:   "https://relay.example",
+		credential: "cred-xyz",
+	})
+	v = vv.(boxesView)
+	for i, box := range v.boxes {
+		if persistedBaseDomain(t, box) == base {
+			v.cursor = i
+		}
+	}
+	vv, _ = v.Update(boxesLoadedMsg{boxes: local, current: "local"})
+	v = vv.(boxesView)
+	if len(v.boxes) != 2 || persistedBaseDomain(t, v.boxes[v.cursor]) != base {
+		t.Fatalf("local refresh must preserve the selected merged row: cursor=%d boxes=%+v", v.cursor, v.boxes)
+	}
+}
+
+func TestRelayOnlyRowsCannotBeEditedOrRemoved(t *testing.T) {
+	v := newBoxesView(fakeDialer(fakeAPI{}, "", false, nil))
+	vv, _ := v.Update(boxesLoadedMsg{
+		boxes:   []config.Box{{Name: "local", Addr: "192.168.1.6:8088"}},
+		current: "local",
+	})
+	v = vv.(boxesView)
+	vv, _ = v.Update(relayAgentsLoadedMsg{
+		agents:     []relayclient.Agent{{BaseDomain: "cloud.example", Connected: true}},
+		relayAPI:   "https://relay.example",
+		credential: "cred-xyz",
+	})
+	v = vv.(boxesView)
+	v.cursor = len(v.boxes) - 1
+	if _, cmd := v.Update(keyRunes('x')); cmd != nil {
+		t.Fatal("x on a relay-only live row must not open a local remove action")
+	}
+	if _, cmd := v.Update(keyRunes('e')); cmd != nil {
+		t.Fatal("e on a relay-only live row must not open a local edit action")
+	}
+}
+
+func TestBoxesRefreshUsesRelayCredentialsFromAnySavedBox(t *testing.T) {
+	relay := agentsServer(t, []relayclient.Agent{{BaseDomain: "cloud.example", Connected: true}})
+	defer relay.Close()
+	seedConfig(t, config.ClientFile{
+		Boxes: []config.Box{
+			{Name: "local", Addr: "192.168.1.6:8088"},
+			{Name: "account", RelayAPI: relay.URL, AccountCredential: "cred-xyz"},
+		},
+		Current: "local",
+	})
+	v := newRelayBoxesView(t, fakeDialer(fakeAPI{}, "", false, nil), func(base string) RelayAPI { return relayclient.New(base) })
+	loaded := v.refresh(nil)().(boxesLoadedMsg)
+	vv, cmd := v.Update(loaded)
+	v = vv.(boxesView)
+	for _, msg := range commandMessages(cmd) {
+		vv, _ = v.Update(msg)
+		v = vv.(boxesView)
+	}
+	if len(v.boxes) != 2 || persistedBaseDomain(t, v.boxes[1]) != "cloud.example" {
+		t.Fatalf("relay rows should load from a sibling box's credentials: %+v", v.boxes)
+	}
+}
+
+func TestBoxesRefreshDoesNotRefetchRelayOnEveryPoll(t *testing.T) {
+	relay := agentsServer(t, []relayclient.Agent{{BaseDomain: "cloud.example", Connected: true}})
+	defer relay.Close()
+	seedConfig(t, config.ClientFile{
+		Boxes:   []config.Box{{Name: "local", Addr: "192.168.1.6:8088", RelayAPI: relay.URL, AccountCredential: "cred-xyz"}},
+		Current: "local",
+	})
+	v := newRelayBoxesView(t, fakeDialer(fakeAPI{}, "", false, nil), func(base string) RelayAPI { return relayclient.New(base) })
+	loaded := v.refresh(nil)().(boxesLoadedMsg)
+	vv, cmd := v.Update(loaded)
+	v = vv.(boxesView)
+	var relayMsg tea.Msg
+	for _, msg := range commandMessages(cmd) {
+		if _, ok := msg.(relayAgentsLoadedMsg); ok {
+			relayMsg = msg
+		}
+		vv, _ = v.Update(msg)
+		v = vv.(boxesView)
+	}
+	if relayMsg == nil {
+		t.Fatal("initial boxes load should fetch relay agents")
+	}
+	loaded = v.refresh(nil)().(boxesLoadedMsg)
+	vv, cmd = v.Update(loaded)
+	_ = vv
+	for _, msg := range commandMessages(cmd) {
+		if _, ok := msg.(relayAgentsLoadedMsg); ok {
+			t.Fatal("a later poll must not refetch relay agents")
+		}
+	}
+}
+
+type deadlineAgentsRelay struct {
+	fakeRelay
+	deadline chan<- bool
+}
+
+func (r deadlineAgentsRelay) Agents(ctx context.Context, cred string) ([]relayclient.Agent, error) {
+	_, hasDeadline := ctx.Deadline()
+	r.deadline <- hasDeadline
+	return nil, nil
+}
+
+func TestBoxesRelayFetchUsesBoundedContext(t *testing.T) {
+	seedConfig(t, config.ClientFile{
+		Boxes:   []config.Box{{Name: "local", RelayAPI: "https://relay.example", AccountCredential: "cred-xyz"}},
+		Current: "local",
+	})
+	deadline := make(chan bool, 1)
+	relay := deadlineAgentsRelay{deadline: deadline}
+	v := newRelayBoxesView(t, fakeDialer(fakeAPI{}, "", false, nil), func(string) RelayAPI { return relay })
+	loaded := v.refresh(nil)().(boxesLoadedMsg)
+	_, cmd := v.Update(loaded)
+	_ = commandMessages(cmd)
+	if !<-deadline {
+		t.Fatal("relay agent fetch must carry a timeout context")
 	}
 }
 

@@ -627,7 +627,29 @@ func TestRunGithubResetAborts(t *testing.T) {
 	}
 }
 
-func TestDialBoxRelayOnlyUsesProxiedClient(t *testing.T) {
+func boxWithPersistedAgentIdentity(t *testing.T, box config.Box, baseDomain string) config.Box {
+	t.Helper()
+	data, err := json.Marshal(box)
+	if err != nil {
+		t.Fatalf("marshal box: %v", err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("decode box: %v", err)
+	}
+	raw["base_domain"] = baseDomain
+	data, err = json.Marshal(raw)
+	if err != nil {
+		t.Fatalf("marshal box with identity: %v", err)
+	}
+	var got config.Box
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("decode box with identity: %v", err)
+	}
+	return got
+}
+
+func TestDialBoxRelayOnlyUsesPersistedAgentIdentity(t *testing.T) {
 	var gotPath, gotAuth string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath, gotAuth = r.URL.Path, r.Header.Get("Authorization")
@@ -638,11 +660,11 @@ func TestDialBoxRelayOnlyUsesProxiedClient(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c, addr, remote, err := dialBox(config.Box{
-		Name:              "cloud.example",
+	c, addr, remote, err := dialBox(boxWithPersistedAgentIdentity(t, config.Box{
+		Name:              "living-room",
 		RelayAPI:          srv.URL,
 		AccountCredential: "cred-xyz",
-	})
+	}, "cloud.example"))
 	if err != nil {
 		t.Fatalf("dialBox: %v", err)
 	}
