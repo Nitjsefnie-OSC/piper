@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
 	"testing"
 	"time"
@@ -98,6 +99,139 @@ func runNestedClientConfigWriters(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("nested SaveClient result was overwritten: got %+v, want %+v", got, want)
+	}
+}
+
+func TestNestedIdenticalAndABAWritesAreConflicts(t *testing.T) {
+	base := ClientFile{
+		Boxes:   []Box{{Name: "base", Addr: "base-addr", Token: "base-token"}},
+		Current: "base",
+	}
+	nested := ClientFile{
+		Boxes:   []Box{{Name: "nested", Addr: "nested-addr", Token: "nested-token"}},
+		Current: "nested",
+	}
+	for _, tc := range []struct {
+		name   string
+		writes func() error
+	}{
+		{
+			name: "identical",
+			writes: func() error {
+				return SaveClientFile(base)
+			},
+		},
+		{
+			name: "aba",
+			writes: func() error {
+				if err := SaveClientFile(nested); err != nil {
+					return err
+				}
+				return SaveClientFile(base)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			if err := SaveClientFile(base); err != nil {
+				t.Fatal(err)
+			}
+
+			var nestedErr error
+			outerErr := UpdateClientFile(func(cf *ClientFile) (bool, error) {
+				nestedErr = tc.writes()
+				cf.Boxes[0].Token = "stale-outer-token"
+				return true, nil
+			})
+			if nestedErr != nil {
+				t.Fatalf("nested write failed: %v", nestedErr)
+			}
+			if !errors.Is(outerErr, ErrClientConfigChanged) {
+				t.Fatalf("outer update error = %v, want ErrClientConfigChanged", outerErr)
+			}
+			got, err := LoadClientFile()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(got, base) {
+				t.Fatalf("nested write history was overwritten: got %+v, want %+v", got, base)
+			}
+		})
+	}
+}
+
+func TestNestedWriterThroughHomeAliasDoesNotDeadlock(t *testing.T) {
+	if os.Getenv("PIPER_HOME_ALIAS_WRITER_HELPER") == "1" {
+		runNestedWriterThroughHomeAlias(t)
+		return
+	}
+
+	realHome := t.TempDir()
+	aliasRoot := t.TempDir()
+	aliasA := filepath.Join(aliasRoot, "home-a")
+	aliasB := filepath.Join(aliasRoot, "home-b")
+	if err := os.Symlink(realHome, aliasA); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(realHome, aliasB); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", aliasA)
+	if err := SaveClientFile(ClientFile{
+		Boxes:   []Box{{Name: "old", Addr: "old-addr", Token: "old-token"}},
+		Current: "old",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestNestedWriterThroughHomeAliasDoesNotDeadlock$")
+	cmd.Env = append(os.Environ(),
+		"HOME="+aliasA,
+		"PIPER_HOME_ALIAS_A="+aliasA,
+		"PIPER_HOME_ALIAS_B="+aliasB,
+		"PIPER_HOME_ALIAS_WRITER_HELPER=1",
+	)
+	if err := cmd.Run(); ctx.Err() == context.DeadlineExceeded {
+		t.Fatal("nested writer through a HOME alias deadlocked inside UpdateClientFile callback")
+	} else if err != nil {
+		t.Fatalf("HOME alias helper failed: %v", err)
+	}
+}
+
+func runNestedWriterThroughHomeAlias(t *testing.T) {
+	aliasA := os.Getenv("PIPER_HOME_ALIAS_A")
+	aliasB := os.Getenv("PIPER_HOME_ALIAS_B")
+	if aliasA == "" || aliasB == "" {
+		t.Fatal("HOME aliases were not provided")
+	}
+	t.Setenv("HOME", aliasA)
+	nestedFile := ClientFile{
+		Boxes:   []Box{{Name: "nested", Addr: "nested-addr", Token: "nested-token"}},
+		Current: "nested",
+	}
+	var nestedErr error
+	outerErr := UpdateClientFile(func(cf *ClientFile) (bool, error) {
+		os.Setenv("HOME", aliasB)
+		nestedErr = SaveClientFile(nestedFile)
+		os.Setenv("HOME", aliasA)
+		cf.Boxes[0].Token = "stale-outer-token"
+		return true, nil
+	})
+	if nestedErr != nil {
+		t.Fatalf("nested aliased SaveClientFile failed: %v", nestedErr)
+	}
+	if !errors.Is(outerErr, ErrClientConfigChanged) {
+		t.Fatalf("outer aliased update error = %v, want ErrClientConfigChanged", outerErr)
+	}
+	os.Setenv("HOME", aliasA)
+	got, err := LoadClientFile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, nestedFile) {
+		t.Fatalf("aliased nested writer result was overwritten: got %+v, want %+v", got, nestedFile)
 	}
 }
 

@@ -60,8 +60,11 @@ func TestLegacyIdentityMigrationCannotOverwriteConcurrentConfigWriter(t *testing
 		relayCredentialHash(oldFile), oldBox.RelayAPI, oldBox.AccountCredential,
 		agents, identities,
 	)
-	if err != nil || !accepted {
-		t.Fatalf("migration = accepted %v, err %v", accepted, err)
+	if err != nil {
+		t.Fatalf("migration error = %v", err)
+	}
+	if accepted {
+		t.Fatalf("stale relay identity migration was accepted after a concurrent config replacement")
 	}
 	if err := <-replaced; err != nil {
 		t.Fatal(err)
