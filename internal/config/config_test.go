@@ -566,6 +566,83 @@ func TestSaveClientFileOverwritesExisting(t *testing.T) {
 	}
 }
 
+func TestUpdateClientFileCannotOverwriteAfterConfigDirectoryReplacement(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		symlink bool
+	}{
+		{name: "directory", symlink: false},
+		{name: "symlink", symlink: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			oldConfig := ClientFile{
+				Boxes:   []Box{{Name: "old", Addr: "old-addr", RelayAPI: "old-relay", AccountCredential: "old-cred"}},
+				Current: "old",
+			}
+			if err := SaveClientFile(oldConfig); err != nil {
+				t.Fatal(err)
+			}
+
+			path, err := clientConfigPath()
+			if err != nil {
+				t.Fatal(err)
+			}
+			dir := filepath.Dir(path)
+			movedDir := dir + ".old"
+			replacementDir := dir + ".replacement"
+			newConfig := ClientFile{
+				Boxes: []Box{{
+					Name: "new", Addr: "new-addr", BaseDomain: "new.example",
+					RelayAPI: "new-relay", AccountCredential: "new-cred",
+				}},
+				Current: "new",
+			}
+			var writerErr error
+			updateErr := UpdateClientFile(func(cf *ClientFile) (bool, error) {
+				if err := os.Rename(dir, movedDir); err != nil {
+					return false, err
+				}
+				if tc.symlink {
+					if err := os.MkdirAll(replacementDir, 0o700); err != nil {
+						return false, err
+					}
+					if err := os.Symlink(replacementDir, dir); err != nil {
+						return false, err
+					}
+				} else if err := os.MkdirAll(dir, 0o700); err != nil {
+					return false, err
+				}
+
+				// This writer follows the replacement path and participates in the
+				// public config API, but it locks a different directory inode.
+				writerErr = SaveClientFile(newConfig)
+				if writerErr != nil {
+					return false, writerErr
+				}
+				cf.Boxes[0].BaseDomain = "stale.example"
+				return true, nil
+			})
+			if writerErr != nil {
+				t.Fatalf("replacement writer failed: %v", writerErr)
+			}
+			// A safe transaction may reject the replacement or commit only via
+			// the original directory handle. Either way, it must not overwrite
+			// the writer that owns the replacement path.
+			_ = updateErr
+			got, err := LoadClientFile()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(got.Boxes) != 1 || got.Current != newConfig.Current ||
+				got.Boxes[0] != newConfig.Boxes[0] {
+				t.Fatalf("replacement config was overwritten (update err=%v): got %+v, want %+v", updateErr, got, newConfig)
+			}
+		})
+	}
+}
+
 func TestCurrentBoxFallsBackToFirst(t *testing.T) {
 	cf := ClientFile{Boxes: []Box{{Name: "a"}, {Name: "b"}}, Current: "missing"}
 	b, ok := cf.CurrentBox()
