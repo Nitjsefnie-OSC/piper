@@ -6,6 +6,13 @@
 # The paths-filter gating in ci.yml is deliberately absent: it computes a diff
 # against a base ref that workflow_dispatch does not have, and every step it
 # guards is one we want to run unconditionally here anyway.
+#
+# One exception: ci.yml's three `docker`-filtered steps (QEMU, Buildx,
+# multi-arch image build) are NOT carried. They only ever fire when Dockerfile,
+# .dockerignore, deploy/compose/** or ci.yml itself change, and running a
+# multi-arch image build unconditionally would add many minutes to every
+# verification for a filter that is almost always false. A branch that touches
+# those paths must be verified some other way.
 name: osc-manual
 
 on:
@@ -66,3 +73,16 @@ jobs:
           goreleaser check && exit 0
           rc=$?
           [ "$rc" = 2 ] || exit "$rc"
+
+      - name: Build snapshot packages
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --snapshot --clean
+
+      - name: Verify deb contents
+        run: ./test/packaging/verify_deb.sh
+
+      - name: Verify brew archives
+        run: ./test/packaging/verify_brew.sh
