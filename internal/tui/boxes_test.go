@@ -310,6 +310,7 @@ func TestBoxesViewDeduplicatesRowsFromConfigAndRelay(t *testing.T) {
 		t.Fatal("local rows should schedule the relay fetch")
 	}
 	var relayMsg relayAgentsLoadedMsg
+	gotRelay := false
 	var probe boxProbeMsg
 	switch result := cmd().(type) {
 	case tea.BatchMsg:
@@ -317,16 +318,18 @@ func TestBoxesViewDeduplicatesRowsFromConfigAndRelay(t *testing.T) {
 			switch msg := subcmd().(type) {
 			case relayAgentsLoadedMsg:
 				relayMsg = msg
+				gotRelay = true
 			case boxProbeMsg:
 				probe = msg
 			}
 		}
 	case relayAgentsLoadedMsg:
 		relayMsg = result
+		gotRelay = true
 	case boxProbeMsg:
 		probe = result
 	}
-	if relayMsg.relayAPI != "" {
+	if gotRelay {
 		vv, _ = v.Update(relayMsg)
 		v = vv.(boxesView)
 	}
@@ -379,6 +382,7 @@ func TestBoxesViewDeduplicatedLANRowUsesLANLiveness(t *testing.T) {
 	}
 	result := cmd()
 	var relayMsg relayAgentsLoadedMsg
+	gotRelay := false
 	var probe boxProbeMsg
 	switch result := result.(type) {
 	case tea.BatchMsg:
@@ -386,6 +390,7 @@ func TestBoxesViewDeduplicatedLANRowUsesLANLiveness(t *testing.T) {
 			switch msg := subcmd().(type) {
 			case relayAgentsLoadedMsg:
 				relayMsg = msg
+				gotRelay = true
 			case boxProbeMsg:
 				probe = msg
 			}
@@ -394,8 +399,9 @@ func TestBoxesViewDeduplicatedLANRowUsesLANLiveness(t *testing.T) {
 		probe = result
 	case relayAgentsLoadedMsg:
 		relayMsg = result
+		gotRelay = true
 	}
-	if relayMsg.relayAPI != "" {
+	if gotRelay {
 		vv, _ = v.Update(relayMsg)
 		v = vv.(boxesView)
 	}
@@ -417,14 +423,14 @@ func TestBoxesViewDeduplicatesByPersistedAgentIdentity(t *testing.T) {
 	local := boxWithBaseDomain(t, config.Box{Name: "living-room", Addr: "192.168.1.6:8088"}, base)
 	v := newBoxesView(fakeDialer(fakeAPI{}, "", false, nil))
 	vv, _ := v.Update(boxesLoadedMsg{
-		boxes:   []config.Box{local},
-		current: "living-room",
+		boxes:      []config.Box{local},
+		current:    "living-room",
+		relayAPI:   "https://relay.example",
+		credential: "cred-xyz",
 	})
 	v = vv.(boxesView)
 	vv, _ = v.Update(relayAgentsLoadedMsg{
-		agents:     []relayclient.Agent{{BaseDomain: base, Connected: true}},
-		relayAPI:   "https://relay.example",
-		credential: "cred-xyz",
+		agents: []relayclient.Agent{{BaseDomain: base, Connected: true}},
 	})
 	v = vv.(boxesView)
 	if len(v.boxes) != 1 || v.boxes[0].Name != "living-room" {
@@ -439,12 +445,15 @@ func TestBoxesViewKeepsMergedRowsAcrossLocalRefresh(t *testing.T) {
 	base := "cloud.example"
 	local := []config.Box{{Name: "local", Addr: "192.168.1.6:8088"}}
 	v := newBoxesView(fakeDialer(fakeAPI{}, "", false, nil))
-	vv, _ := v.Update(boxesLoadedMsg{boxes: local, current: "local"})
-	v = vv.(boxesView)
-	vv, _ = v.Update(relayAgentsLoadedMsg{
-		agents:     []relayclient.Agent{{BaseDomain: base, Connected: true}},
+	vv, _ := v.Update(boxesLoadedMsg{
+		boxes:      local,
+		current:    "local",
 		relayAPI:   "https://relay.example",
 		credential: "cred-xyz",
+	})
+	v = vv.(boxesView)
+	vv, _ = v.Update(relayAgentsLoadedMsg{
+		agents: []relayclient.Agent{{BaseDomain: base, Connected: true}},
 	})
 	v = vv.(boxesView)
 	for i, box := range v.boxes {
@@ -452,7 +461,12 @@ func TestBoxesViewKeepsMergedRowsAcrossLocalRefresh(t *testing.T) {
 			v.cursor = i
 		}
 	}
-	vv, _ = v.Update(boxesLoadedMsg{boxes: local, current: "local"})
+	vv, _ = v.Update(boxesLoadedMsg{
+		boxes:      local,
+		current:    "local",
+		relayAPI:   "https://relay.example",
+		credential: "cred-xyz",
+	})
 	v = vv.(boxesView)
 	if len(v.boxes) != 2 || persistedBaseDomain(t, v.boxes[v.cursor]) != base {
 		t.Fatalf("local refresh must preserve the selected merged row: cursor=%d boxes=%+v", v.cursor, v.boxes)
@@ -462,14 +476,14 @@ func TestBoxesViewKeepsMergedRowsAcrossLocalRefresh(t *testing.T) {
 func TestRelayOnlyRowsCannotBeEditedOrRemoved(t *testing.T) {
 	v := newBoxesView(fakeDialer(fakeAPI{}, "", false, nil))
 	vv, _ := v.Update(boxesLoadedMsg{
-		boxes:   []config.Box{{Name: "local", Addr: "192.168.1.6:8088"}},
-		current: "local",
+		boxes:      []config.Box{{Name: "local", Addr: "192.168.1.6:8088"}},
+		current:    "local",
+		relayAPI:   "https://relay.example",
+		credential: "cred-xyz",
 	})
 	v = vv.(boxesView)
 	vv, _ = v.Update(relayAgentsLoadedMsg{
-		agents:     []relayclient.Agent{{BaseDomain: "cloud.example", Connected: true}},
-		relayAPI:   "https://relay.example",
-		credential: "cred-xyz",
+		agents: []relayclient.Agent{{BaseDomain: "cloud.example", Connected: true}},
 	})
 	v = vv.(boxesView)
 	v.cursor = len(v.boxes) - 1

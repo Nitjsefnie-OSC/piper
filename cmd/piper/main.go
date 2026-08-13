@@ -140,7 +140,10 @@ func dialBox(b config.Box) (tui.API, string, bool, error) {
 		if b.AccountCredential == "" {
 			return nil, "", true, errors.New("relay box has no account credential")
 		}
-		return relayClient(b.RelayAPI, b.Name, b.AccountCredential).WithTimeout(tuiRequestTimeout), b.Name, true, nil
+		if b.BaseDomain == "" {
+			return nil, "", true, errors.New("relay box has no agent identity")
+		}
+		return relayClient(b.RelayAPI, b.BaseDomain, b.AccountCredential).WithTimeout(tuiRequestTimeout), b.BaseDomain, true, nil
 	}
 	return client.New(b.Addr, b.Token).WithTimeout(tuiRequestTimeout), b.Addr, false, nil
 }

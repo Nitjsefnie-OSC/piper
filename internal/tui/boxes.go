@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/piperbox/piper/internal/config"
@@ -25,12 +26,30 @@ type boxesView struct {
 	err     error
 	reach   map[string]bool // box name -> last LAN probe result; absent = probing
 	// relayConnected is populated from the account's /agents listing for relay
-	// rows; those rows must never be probed through a LAN address.
+	// rows; those rows must never be probed through a LAN address. Keys are the
+	// persisted relay base domains, not display names.
 	relayConnected map[string]bool
+	// relayRows marks rows synthesized from the live relay listing. They have
+	// no local config entry and are therefore switch-only.
+	relayRows   map[string]bool
+	configBoxes []config.Box
+	relayAgents []relayclient.Agent
+	relayAPI    string
+	credential  string
+	relayLoaded bool
+	// relayFetchStarted is intentionally one-shot for a view instance: relay
+	// liveness is fetched on entry, while the regular tick only refreshes local
+	// config and LAN probes.
+	relayFetchStarted bool
 }
 
 func newBoxesView(dial Dialer) boxesView {
-	return boxesView{dial: dial, reach: map[string]bool{}, relayConnected: map[string]bool{}}
+	return boxesView{
+		dial:           dial,
+		reach:          map[string]bool{},
+		relayConnected: map[string]bool{},
+		relayRows:      map[string]bool{},
+	}
 }
 
 func (v boxesView) Init() tea.Cmd { return nil }
@@ -45,82 +64,97 @@ func (v boxesView) footer() string {
 // enrollment fetch is scheduled after this local result is rendered, so a slow
 // relay cannot hold the saved LAN rows in loading state.
 func (v boxesView) refresh(API) tea.Cmd {
-	relay := v.relay
 	return func() tea.Msg {
 		cf, err := config.LoadClientFile()
 		if err != nil {
 			return errMsg{err}
 		}
-		return boxesLoadedMsg{boxes: cf.Boxes, current: cf.Current, fetchRelay: relay != nil}
+		relayAPI, credential := relayCredentials(cf)
+		return boxesLoadedMsg{
+			boxes:      cf.Boxes,
+			current:    cf.Current,
+			relayAPI:   relayAPI,
+			credential: credential,
+		}
 	}
 }
 
-// fetchRelay loads the current account's relay enrollment list off the UI
+// fetchRelay loads the saved account's relay enrollment list off the UI
 // thread. Local rows are already visible by the time this command runs; a
 // relay failure is shown as a view error without removing those rows.
 func (v boxesView) fetchRelay() tea.Cmd {
 	relay := v.relay
+	relayAPI, credential := v.relayAPI, v.credential
 	return func() tea.Msg {
-		if relay == nil {
-			return relayAgentsLoadedMsg{}
-		}
-		cc, err := config.LoadClient()
-		if err != nil {
-			return relayAgentsLoadedMsg{err: err}
-		}
-		if cc.RelayAPI == "" || cc.AccountCredential == "" {
-			return relayAgentsLoadedMsg{}
-		}
-		rc := relay(cc.RelayAPI)
-		if rc == nil {
-			return relayAgentsLoadedMsg{}
-		}
-		agents, err := rc.Agents(context.Background(), cc.AccountCredential)
-		return relayAgentsLoadedMsg{
-			agents:     agents,
-			relayAPI:   cc.RelayAPI,
-			credential: cc.AccountCredential,
-			err:        err,
+		ctx, cancel := context.WithTimeout(context.Background(), relayRequestTimeout)
+		defer cancel()
+		agents, err := relay(relayAPI).Agents(ctx, credential)
+		return relayAgentsLoadedMsg{agents: agents, err: err}
+	}
+}
+
+const relayRequestTimeout = 5 * time.Second
+
+func relayCredentials(cf config.ClientFile) (string, string) {
+	if current, ok := cf.CurrentBox(); ok && current.RelayAPI != "" && current.AccountCredential != "" {
+		return current.RelayAPI, current.AccountCredential
+	}
+	for _, box := range cf.Boxes {
+		if box.RelayAPI != "" && box.AccountCredential != "" {
+			return box.RelayAPI, box.AccountCredential
 		}
 	}
+	return "", ""
 }
 
 // mergeBoxes keeps saved LAN entries (including their names and addresses) and
 // appends live relay agents that are not already present. A matching local row
-// receives the relay credentials, so it remains one row and keeps its LAN path
-// as the preferred dial path. Relay liveness is used only by relay-only rows.
-func mergeBoxes(local []config.Box, agents []relayclient.Agent, relayAPI, credential string) ([]config.Box, map[string]bool) {
+// is identified by its persisted BaseDomain, receives the relay credentials,
+// and keeps its LAN path as the preferred dial path. Relay liveness is used
+// only by relay-only rows.
+func mergeBoxes(local []config.Box, agents []relayclient.Agent, relayAPI, credential string) ([]config.Box, map[string]bool, map[string]bool) {
 	boxes := make([]config.Box, 0, len(local)+len(agents))
 	byName := make(map[string]int, len(local)+len(agents))
+	byBaseDomain := make(map[string]int, len(local))
 	for _, box := range local {
 		if _, exists := byName[box.Name]; exists {
 			continue
 		}
-		byName[box.Name] = len(boxes)
+		idx := len(boxes)
+		byName[box.Name] = idx
+		if box.BaseDomain != "" {
+			byBaseDomain[box.BaseDomain] = idx
+		}
 		boxes = append(boxes, box)
 	}
 
 	connected := make(map[string]bool, len(agents))
+	relayRows := make(map[string]bool, len(agents))
 	for _, agent := range agents {
 		if agent.BaseDomain == "" {
 			continue
 		}
-		idx, exists := byName[agent.BaseDomain]
+		idx, exists := byBaseDomain[agent.BaseDomain]
 		if exists {
 			boxes[idx].RelayAPI = relayAPI
 			boxes[idx].AccountCredential = credential
-			connected[boxes[idx].Name] = agent.Connected
-			continue
+		} else {
+			name := agent.Name
+			if name == "" {
+				name = agent.BaseDomain
+			}
+			byName[name] = len(boxes)
+			boxes = append(boxes, config.Box{
+				Name:              name,
+				BaseDomain:        agent.BaseDomain,
+				RelayAPI:          relayAPI,
+				AccountCredential: credential,
+			})
+			relayRows[agent.BaseDomain] = true
 		}
-		byName[agent.BaseDomain] = len(boxes)
-		boxes = append(boxes, config.Box{
-			Name:              agent.BaseDomain,
-			RelayAPI:          relayAPI,
-			AccountCredential: credential,
-		})
 		connected[agent.BaseDomain] = agent.Connected
 	}
-	return boxes, connected
+	return boxes, connected, relayRows
 }
 
 // relayOnly reports whether the box at i has no LAN path. LAN-addressable rows
@@ -130,9 +164,20 @@ func (v boxesView) relayOnly(i int) bool {
 	return v.boxes[i].RelayAPI != "" && v.boxes[i].Addr == ""
 }
 
-func (v boxesView) relayRow(name string) bool {
-	_, listed := v.relayConnected[name]
+func relayKey(box config.Box) string {
+	if box.BaseDomain != "" {
+		return box.BaseDomain
+	}
+	return box.Name
+}
+
+func (v boxesView) relayRow(box config.Box) bool {
+	_, listed := v.relayConnected[relayKey(box)]
 	return listed
+}
+
+func (v boxesView) liveRelayRow(box config.Box) bool {
+	return v.relayRows[relayKey(box)]
 }
 
 // probe returns a cmd that dials box and calls ListApps; reachable is true iff
@@ -151,17 +196,32 @@ func (v boxesView) probe(box config.Box) tea.Cmd {
 func (v boxesView) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case boxesLoadedMsg:
-		v.boxes, v.current, v.loaded, v.err = msg.boxes, msg.current, true, msg.err
-		v.relayConnected = msg.relayConnected
-		if v.relayConnected == nil {
-			v.relayConnected = map[string]bool{}
+		selected := ""
+		if v.cursor >= 0 && v.cursor < len(v.boxes) {
+			selected = v.boxes[v.cursor].Name
 		}
-		v.reach = map[string]bool{}
+		v.configBoxes, v.current, v.loaded = append([]config.Box(nil), msg.boxes...), msg.current, true
+		v.relayAPI, v.credential = msg.relayAPI, msg.credential
+		if v.relayLoaded {
+			v.boxes, v.relayConnected, v.relayRows = mergeBoxes(v.configBoxes, v.relayAgents, v.relayAPI, v.credential)
+		} else {
+			v.boxes = append([]config.Box(nil), v.configBoxes...)
+		}
+		v.reach = keepReachable(v.reach, v.boxes)
 		if v.cursor >= len(v.boxes) {
 			v.cursor = max(0, len(v.boxes)-1)
 		}
+		if selected != "" {
+			for i, box := range v.boxes {
+				if box.Name == selected {
+					v.cursor = i
+					break
+				}
+			}
+		}
 		var cmds []tea.Cmd
-		if msg.fetchRelay {
+		if !v.relayFetchStarted && v.relay != nil && msg.relayAPI != "" && msg.credential != "" {
+			v.relayFetchStarted = true
 			cmds = append(cmds, v.fetchRelay())
 		}
 		for i, box := range v.boxes {
@@ -176,10 +236,10 @@ func (v boxesView) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			v.err = msg.err
 			return v, nil
 		}
-		if msg.relayAPI == "" {
-			return v, nil
-		}
-		v.boxes, v.relayConnected = mergeBoxes(v.boxes, msg.agents, msg.relayAPI, msg.credential)
+		v.relayAgents = append([]relayclient.Agent(nil), msg.agents...)
+		v.relayLoaded = true
+		v.boxes, v.relayConnected, v.relayRows = mergeBoxes(v.configBoxes, v.relayAgents, v.relayAPI, v.credential)
+		v.err = nil
 		if v.cursor >= len(v.boxes) {
 			v.cursor = max(0, len(v.boxes)-1)
 		}
@@ -208,18 +268,28 @@ func (v boxesView) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			boxes := v.boxes
 			return v, func() tea.Msg { return pushMsg{newBoxForm(v.dial, boxes)} }
 		case "e":
-			if len(v.boxes) > 0 {
+			if len(v.boxes) > 0 && !v.liveRelayRow(v.boxes[v.cursor]) {
 				boxes, orig := v.boxes, v.boxes[v.cursor]
 				return v, func() tea.Msg { return pushMsg{newBoxFormEdit(v.dial, boxes, orig)} }
 			}
 		case "x":
-			if len(v.boxes) > 0 {
+			if len(v.boxes) > 0 && !v.liveRelayRow(v.boxes[v.cursor]) {
 				name := v.boxes[v.cursor].Name
 				return v, func() tea.Msg { return pushMsg{newRemoveBoxConfirm(name)} }
 			}
 		}
 	}
 	return v, nil
+}
+
+func keepReachable(previous map[string]bool, boxes []config.Box) map[string]bool {
+	kept := make(map[string]bool, len(previous))
+	for _, box := range boxes {
+		if reachable, ok := previous[box.Name]; ok {
+			kept[box.Name] = reachable
+		}
+	}
+	return kept
 }
 
 func (v boxesView) View() string {
@@ -247,8 +317,8 @@ func (v boxesView) status(i int) string {
 	case v.boxes[i].Name == v.current:
 		return "current"
 	case v.relayOnly(i):
-		if v.relayRow(v.boxes[i].Name) {
-			if v.relayConnected[v.boxes[i].Name] {
+		if v.relayRow(v.boxes[i]) {
+			if v.relayConnected[relayKey(v.boxes[i])] {
 				return "●"
 			}
 			return "○"

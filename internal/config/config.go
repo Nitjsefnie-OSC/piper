@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 type Config struct {
@@ -150,22 +151,26 @@ func SystemManaged() bool {
 }
 
 // ClientConfig is the piper CLI's saved credentials/target. Addr/Token are the
-// LAN path (bearer to piperd); RelayAPI/AccountCredential are the relay path
-// (device-flow login), written by `piper login` and read by every other
-// relay-backed command (e.g. `piper github repos`, remote `piper box`).
+// LAN path (bearer to piperd); BaseDomain is the stable relay agent identity;
+// RelayAPI/AccountCredential are the relay path (device-flow login), written by
+// `piper login` and read by every other relay-backed command (e.g. `piper
+// github repos`, remote `piper box`).
 type ClientConfig struct {
 	Addr              string `json:"addr"`
 	Token             string `json:"token"`
+	BaseDomain        string `json:"base_domain,omitempty"`
 	RelayAPI          string `json:"relay_api,omitempty"`
 	AccountCredential string `json:"account_credential,omitempty"`
 }
 
 // Box is one named piperd target in the piper CLI's config file. Addr/Token
-// are the LAN path; RelayAPI/AccountCredential the relay path (wizard-managed).
+// are the LAN path; BaseDomain is the stable relay agent identity;
+// RelayAPI/AccountCredential are the relay path (wizard-managed).
 type Box struct {
 	Name              string `json:"name"`
 	Addr              string `json:"addr"`
 	Token             string `json:"token"`
+	BaseDomain        string `json:"base_domain,omitempty"`
 	RelayAPI          string `json:"relay_api,omitempty"`
 	AccountCredential string `json:"account_credential,omitempty"`
 }
@@ -287,7 +292,13 @@ func LoadClient() (ClientConfig, error) {
 		return cc, err
 	}
 	if b, ok := cf.CurrentBox(); ok {
-		cc = ClientConfig{Addr: b.Addr, Token: b.Token, RelayAPI: b.RelayAPI, AccountCredential: b.AccountCredential}
+		cc = ClientConfig{
+			Addr:              b.Addr,
+			Token:             b.Token,
+			BaseDomain:        b.BaseDomain,
+			RelayAPI:          b.RelayAPI,
+			AccountCredential: b.AccountCredential,
+		}
 	}
 	if v := os.Getenv("PIPER_ADDR"); v != "" {
 		cc.Addr = v
@@ -320,6 +331,7 @@ func SaveClient(cc ClientConfig) error {
 		if cf.Boxes[i].Name == name {
 			cf.Boxes[i].Addr = cc.Addr
 			cf.Boxes[i].Token = cc.Token
+			cf.Boxes[i].BaseDomain = cc.BaseDomain
 			cf.Boxes[i].RelayAPI = cc.RelayAPI
 			cf.Boxes[i].AccountCredential = cc.AccountCredential
 			updated = true
@@ -327,9 +339,44 @@ func SaveClient(cc ClientConfig) error {
 		}
 	}
 	if !updated {
-		cf.Boxes = append(cf.Boxes, Box{Name: name, Addr: cc.Addr, Token: cc.Token, RelayAPI: cc.RelayAPI, AccountCredential: cc.AccountCredential})
+		cf.Boxes = append(cf.Boxes, Box{
+			Name:              name,
+			Addr:              cc.Addr,
+			Token:             cc.Token,
+			BaseDomain:        cc.BaseDomain,
+			RelayAPI:          cc.RelayAPI,
+			AccountCredential: cc.AccountCredential,
+		})
 	}
 	cf.Current = name
+	return SaveClientFile(cf)
+}
+
+// SaveCurrentBoxBaseDomain records the relay's stable identity on the
+// currently selected client box. The display name is user-editable and is not
+// a safe relay handle, so enrollment persists the base domain separately.
+func SaveCurrentBoxBaseDomain(baseDomain string) error {
+	if strings.TrimSpace(baseDomain) == "" {
+		return nil
+	}
+	cf, err := LoadClientFile()
+	if err != nil {
+		return err
+	}
+	if len(cf.Boxes) == 0 {
+		return nil
+	}
+	idx := 0
+	for i, box := range cf.Boxes {
+		if box.Name == cf.Current {
+			idx = i
+			break
+		}
+	}
+	cf.Boxes[idx].BaseDomain = strings.TrimSpace(baseDomain)
+	if cf.Current == "" {
+		cf.Current = cf.Boxes[idx].Name
+	}
 	return SaveClientFile(cf)
 }
 
