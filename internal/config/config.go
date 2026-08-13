@@ -278,6 +278,10 @@ type clientConfigLockState struct {
 	err     error
 	cond    *sync.Cond
 	commit  sync.Mutex
+	// generation advances after every successful client-config commit. It is
+	// deliberately independent of file bytes so an identical or ABA nested
+	// write still invalidates an outer snapshot.
+	generation uint64
 }
 
 type clientConfigLock struct {
@@ -289,8 +293,8 @@ type clientConfigLock struct {
 
 var clientConfigStates = struct {
 	sync.Mutex
-	byPath map[string][]*clientConfigLockState
-}{byPath: make(map[string][]*clientConfigLockState)}
+	active []*clientConfigLockState
+}{}
 
 func withClientConfigLock(fn func(*clientConfigLock) error) error {
 	path, err := clientConfigPath()
@@ -324,8 +328,7 @@ func acquireClientConfigLock(path, dirPath string) (*clientConfigLock, func(), e
 	}
 
 	clientConfigStates.Lock()
-	states := clientConfigStates.byPath[dirPath]
-	for _, state := range states {
+	for _, state := range clientConfigStates.active {
 		stateInfo, statErr := state.dir.Stat()
 		if statErr != nil || !os.SameFile(openedInfo, stateInfo) {
 			continue
@@ -350,7 +353,7 @@ func acquireClientConfigLock(path, dirPath string) (*clientConfigLock, func(), e
 
 	state := &clientConfigLockState{dirPath: dirPath, dir: opened, refs: 1}
 	state.cond = sync.NewCond(&clientConfigStates.Mutex)
-	clientConfigStates.byPath[dirPath] = append(states, state)
+	clientConfigStates.active = append(clientConfigStates.active, state)
 	clientConfigStates.Unlock()
 
 	lockErr := syscall.Flock(int(opened.Fd()), syscall.LOCK_EX)
@@ -374,17 +377,11 @@ func releaseClientConfigLock(state *clientConfigLockState) {
 		clientConfigStates.Unlock()
 		return
 	}
-	states := clientConfigStates.byPath[state.dirPath]
-	for i, candidate := range states {
+	for i, candidate := range clientConfigStates.active {
 		if candidate == state {
-			states = append(states[:i], states[i+1:]...)
+			clientConfigStates.active = append(clientConfigStates.active[:i], clientConfigStates.active[i+1:]...)
 			break
 		}
-	}
-	if len(states) == 0 {
-		delete(clientConfigStates.byPath, state.dirPath)
-	} else {
-		clientConfigStates.byPath[state.dirPath] = states
 	}
 	clientConfigStates.Unlock()
 
@@ -416,17 +413,25 @@ func saveClientFile(tx *clientConfigLock, cf ClientFile) error {
 	}
 	tx.state.commit.Lock()
 	defer tx.state.commit.Unlock()
-	return tx.atomicWrite(data)
+	if err := tx.atomicWrite(data); err != nil {
+		return err
+	}
+	tx.state.generation++
+	return nil
 }
 
 type clientConfigSnapshot struct {
-	data   []byte
-	exists bool
+	data       []byte
+	exists     bool
+	generation uint64
 }
 
 func loadClientFileAt(tx *clientConfigLock) (ClientFile, clientConfigSnapshot, error) {
 	var cf ClientFile
+	tx.state.commit.Lock()
 	snapshot, err := readClientConfigAt(tx)
+	snapshot.generation = tx.state.generation
+	tx.state.commit.Unlock()
 	if err != nil {
 		return cf, clientConfigSnapshot{}, err
 	}
@@ -481,7 +486,14 @@ func saveClientFileIfUnchanged(tx *clientConfigLock, expected clientConfigSnapsh
 	if current.exists != expected.exists || !bytes.Equal(current.data, expected.data) {
 		return ErrClientConfigChanged
 	}
-	return tx.atomicWrite(data)
+	if tx.state.generation != expected.generation {
+		return ErrClientConfigChanged
+	}
+	if err := tx.atomicWrite(data); err != nil {
+		return err
+	}
+	tx.state.generation++
+	return nil
 }
 
 func (tx *clientConfigLock) atomicWrite(data []byte) error {
