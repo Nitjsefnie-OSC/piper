@@ -601,6 +601,13 @@ func TestRelayLoginReusesAValidSavedCredential(t *testing.T) {
 			t.Errorf("stdout missing %q:\n%s", want, out.String())
 		}
 	}
+	cf, err := config.LoadClientFile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cf.Boxes) != 1 || cf.Boxes[0].BaseDomain != "ab12-erin.public.getpiper.co" {
+		t.Fatalf("reusable login did not persist enrolled identity: %+v", cf)
+	}
 }
 
 // A credential the relay no longer accepts must not strand the user: login
