@@ -2,6 +2,7 @@ package config
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"reflect"
@@ -55,8 +56,8 @@ func runNestedClientConfigWriters(t *testing.T) {
 	if nestedErr != nil {
 		t.Fatalf("nested SaveClientFile failed: %v", nestedErr)
 	}
-	if outerErr == nil {
-		t.Fatal("outer UpdateClientFile silently committed over nested SaveClientFile")
+	if !errors.Is(outerErr, ErrClientConfigChanged) {
+		t.Fatalf("outer UpdateClientFile error = %v, want ErrClientConfigChanged", outerErr)
 	}
 	got, err := LoadClientFile()
 	if err != nil {
@@ -81,8 +82,8 @@ func runNestedClientConfigWriters(t *testing.T) {
 	if helperErr != nil {
 		t.Fatalf("nested SaveClient failed: %v", helperErr)
 	}
-	if outerErr == nil {
-		t.Fatal("outer UpdateClientFile silently committed over nested SaveClient")
+	if !errors.Is(outerErr, ErrClientConfigChanged) {
+		t.Fatalf("outer UpdateClientFile error = %v, want ErrClientConfigChanged", outerErr)
 	}
 	got, err = LoadClientFile()
 	if err != nil {
