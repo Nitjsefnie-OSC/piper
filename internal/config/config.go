@@ -4,11 +4,16 @@ package config
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 type Config struct {
@@ -229,7 +234,7 @@ func loadClientFile(path string) (ClientFile, error) {
 // config directory lock serializes this replacement with every writer using
 // the client-config API, including read-modify-write transactions.
 func SaveClientFile(cf ClientFile) error {
-	return withClientConfigLock(func(path string) error { return saveClientFile(path, cf) })
+	return withClientConfigLock(func(tx *clientConfigLock) error { return saveClientFile(tx, cf) })
 }
 
 // UpdateClientFile runs update against the current client config while holding
@@ -237,8 +242,8 @@ func SaveClientFile(cf ClientFile) error {
 // write, which lets conditional updates reject a stale snapshot without
 // touching the file.
 func UpdateClientFile(update func(*ClientFile) (changed bool, err error)) error {
-	return withClientConfigLock(func(path string) error {
-		cf, err := loadClientFile(path)
+	return withClientConfigLock(func(tx *clientConfigLock) error {
+		cf, err := loadClientFileAt(tx)
 		if err != nil {
 			return err
 		}
@@ -246,11 +251,21 @@ func UpdateClientFile(update func(*ClientFile) (changed bool, err error)) error 
 		if err != nil || !changed {
 			return err
 		}
-		return saveClientFile(path, cf)
+		return saveClientFile(tx, cf)
 	})
 }
 
-func withClientConfigLock(fn func(path string) error) error {
+var clientConfigTempSequence uint64
+
+var errClientConfigDirectoryChanged = errors.New("client config directory changed during transaction")
+
+type clientConfigLock struct {
+	path    string
+	dirPath string
+	dir     *os.File
+}
+
+func withClientConfigLock(fn func(*clientConfigLock) error) error {
 	path, err := clientConfigPath()
 	if err != nil {
 		return err
@@ -268,15 +283,116 @@ func withClientConfigLock(fn func(path string) error) error {
 		return err
 	}
 	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
-	return fn(path)
+	tx := &clientConfigLock{path: path, dirPath: dir, dir: lock}
+	if err := tx.ensureCurrentDirectory(); err != nil {
+		return err
+	}
+	return fn(tx)
 }
 
-func saveClientFile(path string, cf ClientFile) error {
+func (tx *clientConfigLock) ensureCurrentDirectory() error {
+	current, err := os.Stat(tx.dirPath)
+	if err != nil {
+		return fmt.Errorf("%w: stat current directory: %v", errClientConfigDirectoryChanged, err)
+	}
+	locked, err := tx.dir.Stat()
+	if err != nil {
+		return fmt.Errorf("%w: stat locked directory: %v", errClientConfigDirectoryChanged, err)
+	}
+	if !os.SameFile(current, locked) {
+		return errClientConfigDirectoryChanged
+	}
+	return nil
+}
+
+func saveClientFile(tx *clientConfigLock, cf ClientFile) error {
 	data, err := json.MarshalIndent(cf, "", "  ")
 	if err != nil {
 		return err
 	}
-	return atomicWriteFile(path, data)
+	return tx.atomicWrite(data)
+}
+
+func loadClientFileAt(tx *clientConfigLock) (ClientFile, error) {
+	var cf ClientFile
+	fd, err := unix.Openat(int(tx.dir.Fd()), filepath.Base(tx.path), unix.O_RDONLY|unix.O_CLOEXEC, 0)
+	if errors.Is(err, os.ErrNotExist) {
+		return cf, nil
+	}
+	if err != nil {
+		return cf, err
+	}
+	f := os.NewFile(uintptr(fd), filepath.Base(tx.path))
+	if f == nil {
+		_ = unix.Close(fd)
+		return cf, errors.New("open client config: invalid file descriptor")
+	}
+	data, readErr := io.ReadAll(f)
+	closeErr := f.Close()
+	if readErr != nil {
+		return cf, readErr
+	}
+	if closeErr != nil {
+		return cf, closeErr
+	}
+	_ = json.Unmarshal(data, &cf)
+	if len(cf.Boxes) > 0 && cf.Current == "" {
+		cf.Current = cf.Boxes[0].Name
+	}
+	return cf, nil
+}
+
+func (tx *clientConfigLock) atomicWrite(data []byte) error {
+	if err := tx.ensureCurrentDirectory(); err != nil {
+		return err
+	}
+	base := filepath.Base(tx.path)
+	for attempt := 0; attempt < 100; attempt++ {
+		tempName := fmt.Sprintf(".%s.%d.%d.tmp", base, os.Getpid(), atomic.AddUint64(&clientConfigTempSequence, 1))
+		fd, err := unix.Openat(int(tx.dir.Fd()), tempName,
+			unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_CLOEXEC, 0o600)
+		if errors.Is(err, os.ErrExist) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if err := writeClientConfigTemp(fd, tempName, data); err != nil {
+			_ = unix.Unlinkat(int(tx.dir.Fd()), tempName, 0)
+			return err
+		}
+		if err := tx.ensureCurrentDirectory(); err != nil {
+			_ = unix.Unlinkat(int(tx.dir.Fd()), tempName, 0)
+			return err
+		}
+		if err := unix.Renameat(int(tx.dir.Fd()), tempName, int(tx.dir.Fd()), base); err != nil {
+			_ = unix.Unlinkat(int(tx.dir.Fd()), tempName, 0)
+			return err
+		}
+		return nil
+	}
+	return fmt.Errorf("create client config temp file: too many name collisions")
+}
+
+func writeClientConfigTemp(fd int, name string, data []byte) error {
+	f := os.NewFile(uintptr(fd), name)
+	if f == nil {
+		_ = unix.Close(fd)
+		return errors.New("create client config temp file: invalid file descriptor")
+	}
+	if err := unix.Fchmod(fd, 0o600); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 // atomicWriteFile writes data to path atomically: bytes are staged to a temp
