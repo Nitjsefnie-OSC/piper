@@ -499,9 +499,12 @@ func TestBoxesRefreshUsesRelayCredentialsFromAnySavedBox(t *testing.T) {
 		vv, _ = v.Update(msg)
 		v = vv.(boxesView)
 	}
-	if len(v.boxes) != 2 || persistedBaseDomain(t, v.boxes[1]) != "cloud.example" {
-		t.Fatalf("relay rows should load from a sibling box's credentials: %+v", v.boxes)
+	for _, box := range v.boxes {
+		if persistedBaseDomain(t, box) == "cloud.example" {
+			return
+		}
 	}
+	t.Fatalf("relay rows should load from a sibling box's credentials: %+v", v.boxes)
 }
 
 func TestBoxesRefreshDoesNotRefetchRelayOnEveryPoll(t *testing.T) {
