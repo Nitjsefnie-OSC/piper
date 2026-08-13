@@ -316,7 +316,10 @@ func persistLegacyIdentities(expectedHash, relayAPI, credential string, agents [
 		if loadErr != nil {
 			return current, false, loadErr
 		}
-		return latest, true, nil
+		// The relay response was derived from the superseded snapshot. Keep the
+		// newer config visible, but reject this response so the caller refreshes
+		// instead of authorizing stale identities or credentials.
+		return latest, false, nil
 	}
 	return current, accepted, err
 }
