@@ -676,9 +676,12 @@ func TestBoxesRelayFetchUsesConfiguredTimeout(t *testing.T) {
 	_ = commandMessages(cmd)
 	got := <-deadline
 	finished := time.Now()
-	const tolerance = 500 * time.Millisecond
-	if got.Before(started.Add(relayRequestTimeout-tolerance)) || got.After(finished.Add(relayRequestTimeout+tolerance)) {
-		t.Fatalf("relay deadline = %s, want approximately %s from request start", got, relayRequestTimeout)
+	const (
+		wantTimeout = 5 * time.Second
+		tolerance   = 500 * time.Millisecond
+	)
+	if got.Before(started.Add(wantTimeout-tolerance)) || got.After(finished.Add(wantTimeout+tolerance)) {
+		t.Fatalf("relay deadline = %s, want approximately %s from request start", got, wantTimeout)
 	}
 }
 
