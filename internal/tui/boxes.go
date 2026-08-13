@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
@@ -307,6 +308,16 @@ func persistLegacyIdentities(expectedHash, relayAPI, credential string, agents [
 		accepted = true
 		return true, nil
 	})
+	if errors.Is(err, config.ErrClientConfigChanged) {
+		// A same-process writer may commit while the relay response is being
+		// converted. Its current config supersedes this stale migration result;
+		// expose that config and let a later refresh retry identity migration.
+		latest, loadErr := config.LoadClientFile()
+		if loadErr != nil {
+			return current, false, loadErr
+		}
+		return latest, true, nil
+	}
 	return current, accepted, err
 }
 
