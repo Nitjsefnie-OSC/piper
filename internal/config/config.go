@@ -2,6 +2,7 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 
@@ -237,13 +239,22 @@ func SaveClientFile(cf ClientFile) error {
 	return withClientConfigLock(func(tx *clientConfigLock) error { return saveClientFile(tx, cf) })
 }
 
+// ErrClientConfigChanged reports that another writer changed the client config
+// after an UpdateClientFile callback loaded its snapshot. The callback may
+// compose another client-config writer; that nested writer reuses the
+// process-local transaction lock and commits first, while the outer update
+// returns this error instead of overwriting it with a stale snapshot.
+var ErrClientConfigChanged = errors.New("client config changed during update")
+
 // UpdateClientFile runs update against the current client config while holding
 // the cross-process config-directory lock. Returning changed=false skips the
 // write, which lets conditional updates reject a stale snapshot without
-// touching the file.
+// touching the file. A nested same-process writer reuses the active directory
+// transaction and may commit; the outer update then returns
+// ErrClientConfigChanged if its loaded snapshot is no longer current.
 func UpdateClientFile(update func(*ClientFile) (changed bool, err error)) error {
 	return withClientConfigLock(func(tx *clientConfigLock) error {
-		cf, err := loadClientFileAt(tx)
+		cf, snapshot, err := loadClientFileAt(tx)
 		if err != nil {
 			return err
 		}
@@ -251,7 +262,7 @@ func UpdateClientFile(update func(*ClientFile) (changed bool, err error)) error 
 		if err != nil || !changed {
 			return err
 		}
-		return saveClientFile(tx, cf)
+		return saveClientFileIfUnchanged(tx, snapshot, cf)
 	})
 }
 
@@ -259,11 +270,27 @@ var clientConfigTempSequence uint64
 
 var errClientConfigDirectoryChanged = errors.New("client config directory changed during transaction")
 
+type clientConfigLockState struct {
+	dirPath string
+	dir     *os.File
+	refs    int
+	ready   bool
+	err     error
+	cond    *sync.Cond
+	commit  sync.Mutex
+}
+
 type clientConfigLock struct {
 	path    string
 	dirPath string
 	dir     *os.File
+	state   *clientConfigLockState
 }
+
+var clientConfigStates = struct {
+	sync.Mutex
+	byPath map[string][]*clientConfigLockState
+}{byPath: make(map[string][]*clientConfigLockState)}
 
 func withClientConfigLock(fn func(*clientConfigLock) error) error {
 	path, err := clientConfigPath()
@@ -271,23 +298,100 @@ func withClientConfigLock(fn func(*clientConfigLock) error) error {
 		return err
 	}
 	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
-	lock, err := os.Open(dir)
+	tx, release, err := acquireClientConfigLock(path, dir)
 	if err != nil {
 		return err
 	}
-	defer lock.Close()
-	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
-		return err
-	}
-	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
-	tx := &clientConfigLock{path: path, dirPath: dir, dir: lock}
+	defer release()
 	if err := tx.ensureCurrentDirectory(); err != nil {
 		return err
 	}
 	return fn(tx)
+}
+
+func acquireClientConfigLock(path, dirPath string) (*clientConfigLock, func(), error) {
+	if err := os.MkdirAll(dirPath, 0o700); err != nil {
+		return nil, nil, err
+	}
+	opened, err := os.Open(dirPath)
+	if err != nil {
+		return nil, nil, err
+	}
+	openedInfo, err := opened.Stat()
+	if err != nil {
+		_ = opened.Close()
+		return nil, nil, err
+	}
+
+	clientConfigStates.Lock()
+	states := clientConfigStates.byPath[dirPath]
+	for _, state := range states {
+		stateInfo, statErr := state.dir.Stat()
+		if statErr != nil || !os.SameFile(openedInfo, stateInfo) {
+			continue
+		}
+		state.refs++
+		clientConfigStates.Unlock()
+		_ = opened.Close()
+
+		clientConfigStates.Lock()
+		for !state.ready {
+			state.cond.Wait()
+		}
+		stateErr := state.err
+		clientConfigStates.Unlock()
+		if stateErr != nil {
+			releaseClientConfigLock(state)
+			return nil, nil, stateErr
+		}
+		tx := &clientConfigLock{path: path, dirPath: dirPath, dir: state.dir, state: state}
+		return tx, func() { releaseClientConfigLock(state) }, nil
+	}
+
+	state := &clientConfigLockState{dirPath: dirPath, dir: opened, refs: 1}
+	state.cond = sync.NewCond(&clientConfigStates.Mutex)
+	clientConfigStates.byPath[dirPath] = append(states, state)
+	clientConfigStates.Unlock()
+
+	lockErr := syscall.Flock(int(opened.Fd()), syscall.LOCK_EX)
+	clientConfigStates.Lock()
+	state.err = lockErr
+	state.ready = true
+	state.cond.Broadcast()
+	clientConfigStates.Unlock()
+	if lockErr != nil {
+		releaseClientConfigLock(state)
+		return nil, nil, lockErr
+	}
+	tx := &clientConfigLock{path: path, dirPath: dirPath, dir: opened, state: state}
+	return tx, func() { releaseClientConfigLock(state) }, nil
+}
+
+func releaseClientConfigLock(state *clientConfigLockState) {
+	clientConfigStates.Lock()
+	state.refs--
+	if state.refs > 0 {
+		clientConfigStates.Unlock()
+		return
+	}
+	states := clientConfigStates.byPath[state.dirPath]
+	for i, candidate := range states {
+		if candidate == state {
+			states = append(states[:i], states[i+1:]...)
+			break
+		}
+	}
+	if len(states) == 0 {
+		delete(clientConfigStates.byPath, state.dirPath)
+	} else {
+		clientConfigStates.byPath[state.dirPath] = states
+	}
+	clientConfigStates.Unlock()
+
+	if state.ready && state.err == nil {
+		_ = syscall.Flock(int(state.dir.Fd()), syscall.LOCK_UN)
+	}
+	_ = state.dir.Close()
 }
 
 func (tx *clientConfigLock) ensureCurrentDirectory() error {
@@ -310,36 +414,74 @@ func saveClientFile(tx *clientConfigLock, cf ClientFile) error {
 	if err != nil {
 		return err
 	}
+	tx.state.commit.Lock()
+	defer tx.state.commit.Unlock()
 	return tx.atomicWrite(data)
 }
 
-func loadClientFileAt(tx *clientConfigLock) (ClientFile, error) {
+type clientConfigSnapshot struct {
+	data   []byte
+	exists bool
+}
+
+func loadClientFileAt(tx *clientConfigLock) (ClientFile, clientConfigSnapshot, error) {
 	var cf ClientFile
+	snapshot, err := readClientConfigAt(tx)
+	if err != nil {
+		return cf, clientConfigSnapshot{}, err
+	}
+	if !snapshot.exists {
+		return cf, snapshot, nil
+	}
+	_ = json.Unmarshal(snapshot.data, &cf)
+	if len(cf.Boxes) > 0 && cf.Current == "" {
+		cf.Current = cf.Boxes[0].Name
+	}
+	return cf, snapshot, nil
+}
+
+func readClientConfigAt(tx *clientConfigLock) (clientConfigSnapshot, error) {
 	fd, err := unix.Openat(int(tx.dir.Fd()), filepath.Base(tx.path), unix.O_RDONLY|unix.O_CLOEXEC, 0)
 	if errors.Is(err, os.ErrNotExist) {
-		return cf, nil
+		return clientConfigSnapshot{}, nil
 	}
 	if err != nil {
-		return cf, err
+		return clientConfigSnapshot{}, err
 	}
 	f := os.NewFile(uintptr(fd), filepath.Base(tx.path))
 	if f == nil {
 		_ = unix.Close(fd)
-		return cf, errors.New("open client config: invalid file descriptor")
+		return clientConfigSnapshot{}, errors.New("open client config: invalid file descriptor")
 	}
 	data, readErr := io.ReadAll(f)
 	closeErr := f.Close()
 	if readErr != nil {
-		return cf, readErr
+		return clientConfigSnapshot{}, readErr
 	}
 	if closeErr != nil {
-		return cf, closeErr
+		return clientConfigSnapshot{}, closeErr
 	}
-	_ = json.Unmarshal(data, &cf)
-	if len(cf.Boxes) > 0 && cf.Current == "" {
-		cf.Current = cf.Boxes[0].Name
+	return clientConfigSnapshot{data: data, exists: true}, nil
+}
+
+func saveClientFileIfUnchanged(tx *clientConfigLock, expected clientConfigSnapshot, cf ClientFile) error {
+	data, err := json.MarshalIndent(cf, "", "  ")
+	if err != nil {
+		return err
 	}
-	return cf, nil
+	tx.state.commit.Lock()
+	defer tx.state.commit.Unlock()
+	if err := tx.ensureCurrentDirectory(); err != nil {
+		return err
+	}
+	current, err := readClientConfigAt(tx)
+	if err != nil {
+		return err
+	}
+	if current.exists != expected.exists || !bytes.Equal(current.data, expected.data) {
+		return ErrClientConfigChanged
+	}
+	return tx.atomicWrite(data)
 }
 
 func (tx *clientConfigLock) atomicWrite(data []byte) error {
