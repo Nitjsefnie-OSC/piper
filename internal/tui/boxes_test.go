@@ -12,6 +12,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/piperbox/piper/internal/config"
+	"github.com/piperbox/piper/internal/enrollapi"
 	"github.com/piperbox/piper/internal/relayclient"
 )
 
@@ -28,6 +29,16 @@ func seedConfig(t *testing.T, cf config.ClientFile) {
 // fakeDialer returns a Dialer that always yields the given result.
 func fakeDialer(c API, addr string, remote bool, err error) Dialer {
 	return func(config.Box) (API, string, bool, error) { return c, addr, remote, err }
+}
+
+type identityFakeAPI struct {
+	fakeAPI
+	status enrollapi.Status
+	err    error
+}
+
+func (f identityFakeAPI) RelayStatus() (enrollapi.Status, error) {
+	return f.status, f.err
 }
 
 // boxWithBaseDomain adds the persisted agent identity through the JSON shape
@@ -501,13 +512,44 @@ func TestBoxesViewKeepsRelaySelectionWhenDisplayNamesCollide(t *testing.T) {
 	}
 }
 
+func TestBoxesSelectionSurvivesLiveToConfigProvenanceTransition(t *testing.T) {
+	lan := boxWithBaseDomain(t, config.Box{Name: "same", Addr: "192.168.1.6:8088"}, "lan.example")
+	v := newBoxesView(fakeDialer(fakeAPI{}, "", false, nil))
+	vv, _ := v.Update(boxesLoadedMsg{
+		boxes: []config.Box{lan}, current: "same",
+		relayAPI: "https://relay.example", credential: "cred-xyz",
+	})
+	v = vv.(boxesView)
+	vv, _ = v.Update(relayAgentsLoadedMsg{
+		agents: []relayclient.Agent{{Name: "same", BaseDomain: "remote.example", Connected: true}},
+	})
+	v = vv.(boxesView)
+	if len(v.boxes) != 2 {
+		t.Fatalf("want LAN and live rows, got %+v", v.boxes)
+	}
+	v.cursor = 1 // select live remote.example while it is relay-only
+
+	if v.boxes[0].Name != v.boxes[1].Name {
+		t.Fatalf("fixture must retain duplicate display names: boxes=%+v", v.boxes)
+	}
+	remote := boxWithBaseDomain(t, config.Box{Name: "remote"}, "remote.example")
+	vv, _ = v.Update(boxesLoadedMsg{
+		boxes: []config.Box{remote, lan}, current: "same",
+		relayAPI: "https://relay.example", credential: "cred-xyz",
+	})
+	v = vv.(boxesView)
+	if v.cursor != 0 || persistedBaseDomain(t, v.boxes[v.cursor]) != "remote.example" {
+		t.Fatalf("selection lost the BaseDomain across provenance transition: cursor=%d boxes=%+v", v.cursor, v.boxes)
+	}
+}
+
 func TestLegacyRelayBoxMigratesIdentityOnFirstTUIEntry(t *testing.T) {
 	const base = "ab12-erin.public.getpiper.co"
 	seedConfig(t, config.ClientFile{
 		Boxes:   []config.Box{{Name: "default", Addr: "192.168.1.6:8088", RelayAPI: "https://relay.example", AccountCredential: "cred-xyz"}},
 		Current: "default",
 	})
-	v := newRelayBoxesView(t, fakeDialer(fakeAPI{}, "", false, nil), relayFor(fakeRelay{
+	v := newRelayBoxesView(t, fakeDialer(identityFakeAPI{status: enrollapi.Status{BaseDomain: base}}, "", false, nil), relayFor(fakeRelay{
 		agents: []relayclient.Agent{{Name: "default", BaseDomain: base, Connected: true}},
 	}))
 	loaded := v.refresh(nil)().(boxesLoadedMsg)
@@ -527,6 +569,31 @@ func TestLegacyRelayBoxMigratesIdentityOnFirstTUIEntry(t *testing.T) {
 	}
 	if len(cf.Boxes) != 1 || cf.Boxes[0].BaseDomain != base {
 		t.Fatalf("legacy identity was not persisted: %+v", cf)
+	}
+}
+
+func TestLegacyMigrationDoesNotGuessFromUnrelatedDisplayName(t *testing.T) {
+	const base = "different-machine.public.example"
+	seedConfig(t, config.ClientFile{
+		Boxes:   []config.Box{{Name: "prod", Addr: "192.168.1.6:8088", RelayAPI: "https://relay.example", AccountCredential: "cred-xyz"}},
+		Current: "prod",
+	})
+	v := newRelayBoxesView(t, fakeDialer(fakeAPI{}, "", false, nil), relayFor(fakeRelay{
+		agents: []relayclient.Agent{{Name: "prod", BaseDomain: base, Connected: true}},
+	}))
+	loaded := v.refresh(nil)().(boxesLoadedMsg)
+	vv, cmd := v.Update(loaded)
+	v = vv.(boxesView)
+	for _, msg := range commandMessages(cmd) {
+		vv, _ = v.Update(msg)
+		v = vv.(boxesView)
+	}
+	cf, err := config.LoadClientFile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cf.Boxes) != 1 || cf.Boxes[0].BaseDomain != "" {
+		t.Fatalf("unrelated same-name LAN box was falsely migrated: %+v", cf)
 	}
 }
 
@@ -774,6 +841,49 @@ func TestBoxesRefreshRejectsLateRelayResultAfterCredentialRefresh(t *testing.T) 
 	v = vv.(boxesView)
 	if v.relayLoaded || len(v.boxes) != 1 || persistedBaseDomain(t, v.boxes[0]) != "" {
 		t.Fatalf("stale relay response resurrected old-account state: relayLoaded=%v boxes=%+v", v.relayLoaded, v.boxes)
+	}
+}
+
+func TestBoxesRefreshCannotOverwriteReplacedCredentialsDuringLegacyMigration(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	const oldBase = "old-agent.public.example"
+	relay := blockingAgentsRelay{
+		fakeRelay: fakeRelay{agents: []relayclient.Agent{{Name: "old", BaseDomain: oldBase, Connected: true}}},
+		started:   started,
+		release:   release,
+	}
+	seedConfig(t, config.ClientFile{
+		Boxes:   []config.Box{{Name: "old", Addr: "192.168.1.6:8088", RelayAPI: "https://old-relay.example", AccountCredential: "old-cred"}},
+		Current: "old",
+	})
+	v := newBoxesView(fakeDialer(identityFakeAPI{status: enrollapi.Status{BaseDomain: oldBase}}, "", false, nil))
+	v.relay = func(string) RelayAPI { return relay }
+	loaded := v.refresh(nil)().(boxesLoadedMsg)
+	vv, cmd := v.Update(loaded)
+	v = vv.(boxesView)
+	if cmd == nil {
+		t.Fatal("initial config should start a relay fetch")
+	}
+	result := make(chan tea.Msg, 1)
+	go func() { result <- cmd() }()
+	<-started
+
+	if err := config.SaveClientFile(config.ClientFile{
+		Boxes:   []config.Box{{Name: "old", Addr: "192.168.1.6:8088", RelayAPI: "https://new-relay.example", AccountCredential: "new-cred"}},
+		Current: "old",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	vv, _ = v.Update(<-result)
+	v = vv.(boxesView)
+	cf, err := config.LoadClientFile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cf.Boxes) != 1 || cf.Boxes[0].RelayAPI != "https://new-relay.example" || cf.Boxes[0].AccountCredential != "new-cred" || cf.Boxes[0].BaseDomain != "" {
+		t.Fatalf("late migration overwrote replaced credentials or identity: %+v", cf)
 	}
 }
 
