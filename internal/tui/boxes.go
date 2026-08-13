@@ -10,6 +10,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/piperbox/piper/internal/config"
+	"github.com/piperbox/piper/internal/enrollapi"
 	"github.com/piperbox/piper/internal/relayclient"
 )
 
@@ -33,13 +34,14 @@ type boxesView struct {
 	relayConnected map[string]bool
 	// relayRows marks rows synthesized from the live relay listing. They have
 	// no local config entry and are therefore switch-only.
-	relayRows   map[string]bool
-	configBoxes []config.Box
-	relayAgents []relayclient.Agent
-	relayAPI    string
-	credential  string
-	relayLoaded bool
-	viewID      uint64
+	relayRows           map[string]bool
+	configBoxes         []config.Box
+	relayAgents         []relayclient.Agent
+	relayAPI            string
+	credential          string
+	relayCredentialHash string
+	relayLoaded         bool
+	viewID              uint64
 	// configGeneration changes when the loaded config or selected relay
 	// credentials change. Relay results are accepted only for the generation
 	// that launched them.
@@ -90,12 +92,13 @@ func (v boxesView) refresh(API) tea.Cmd {
 		}
 		relayAPI, credential := relayCredentials(cf)
 		return boxesLoadedMsg{
-			boxes:      cf.Boxes,
-			current:    cf.Current,
-			relayAPI:   relayAPI,
-			credential: credential,
-			viewID:     viewID,
-			requestID:  requestID,
+			boxes:               cf.Boxes,
+			current:             cf.Current,
+			relayAPI:            relayAPI,
+			credential:          credential,
+			relayCredentialHash: relayCredentialHash(cf),
+			viewID:              viewID,
+			requestID:           requestID,
 		}
 	}
 }
@@ -106,19 +109,25 @@ func (v boxesView) refresh(API) tea.Cmd {
 func (v boxesView) fetchRelay(configGeneration, requestGeneration uint64) tea.Cmd {
 	relay := v.relay
 	relayAPI, credential := v.relayAPI, v.credential
+	relayCredentialHash := v.relayCredentialHash
+	configBoxes := append([]config.Box(nil), v.configBoxes...)
+	dial := v.dial
 	viewID := v.viewID
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), relayRequestTimeout)
 		defer cancel()
 		agents, err := relay(relayAPI).Agents(ctx, credential)
+		identities := localRelayIdentities(dial, configBoxes, agents)
 		return relayAgentsLoadedMsg{
-			agents:            agents,
-			err:               err,
-			viewID:            viewID,
-			configGeneration:  configGeneration,
-			requestGeneration: requestGeneration,
-			relayAPI:          relayAPI,
-			credential:        credential,
+			agents:              agents,
+			identities:          identities,
+			err:                 err,
+			viewID:              viewID,
+			configGeneration:    configGeneration,
+			requestGeneration:   requestGeneration,
+			relayAPI:            relayAPI,
+			credential:          credential,
+			relayCredentialHash: relayCredentialHash,
 		}
 	}
 }
@@ -135,6 +144,66 @@ func relayCredentials(cf config.ClientFile) (string, string) {
 		}
 	}
 	return "", ""
+}
+
+func relayCredentialHash(cf config.ClientFile) string {
+	var b strings.Builder
+	for _, box := range cf.Boxes {
+		fmt.Fprintf(&b, "%d:%s%d:%s%d:%s\x00", len(box.RelayAPI), box.RelayAPI, len(box.AccountCredential), box.AccountCredential, len(box.Name), box.Name)
+	}
+	return b.String()
+}
+
+func boxIdentityKey(box config.Box) string {
+	var b strings.Builder
+	for _, value := range []string{box.Name, box.Addr, box.Token, box.BaseDomain, box.RelayAPI, box.AccountCredential} {
+		fmt.Fprintf(&b, "%d:%s\x00", len(value), value)
+	}
+	return b.String()
+}
+
+type relayStatusReader interface {
+	RelayStatus() (enrollapi.Status, error)
+}
+
+func localRelayIdentities(dial Dialer, boxes []config.Box, agents []relayclient.Agent) map[string]string {
+	identities := make(map[string]string)
+	if dial == nil {
+		return identities
+	}
+	// Names only narrow which local daemons need a status read. They are never
+	// used as identity evidence: migration still requires the daemon's own
+	// BaseDomain and a matching BaseDomain in the fetched relay listing.
+	candidates := make(map[string]struct{}, len(agents)*2)
+	for _, agent := range agents {
+		if agent.Name != "" {
+			candidates[agent.Name] = struct{}{}
+		}
+		if agent.BaseDomain != "" {
+			candidates[agent.BaseDomain] = struct{}{}
+		}
+	}
+	for _, box := range boxes {
+		if box.BaseDomain != "" || box.Addr == "" {
+			continue
+		}
+		if _, ok := candidates[box.Name]; !ok {
+			continue
+		}
+		api, _, _, err := dial(box)
+		if err != nil || api == nil {
+			continue
+		}
+		reader, ok := api.(relayStatusReader)
+		if !ok {
+			continue
+		}
+		status, err := reader.RelayStatus()
+		if err == nil && status.BaseDomain != "" {
+			identities[boxIdentityKey(box)] = status.BaseDomain
+		}
+	}
+	return identities
 }
 
 // mergeBoxes keeps saved LAN entries (including their names and addresses) and
@@ -188,51 +257,55 @@ func mergeBoxes(local []config.Box, agents []relayclient.Agent, relayAPI, creden
 }
 
 // migrateLegacyBoxes gives pre-base_domain configs a safe one-time upgrade
-// path. Older releases displayed the relay base domain as Name, so a legacy
-// local row may be paired with exactly one live agent by that old name. If the
-// name is ambiguous, leave the row untouched rather than guessing an identity.
-func migrateLegacyBoxes(local []config.Box, agents []relayclient.Agent) ([]config.Box, bool) {
+// path. The identity evidence is read from the enrolled local piperd and must
+// also occur in the current relay listing; display names are never evidence.
+func migrateLegacyBoxes(local []config.Box, agents []relayclient.Agent, identities map[string]string) ([]config.Box, bool) {
 	boxes := append([]config.Box(nil), local...)
-	nameCounts := make(map[string]int, len(boxes))
-	for _, box := range boxes {
-		nameCounts[box.Name]++
-	}
-	byName := make(map[string]map[string]struct{}, len(agents))
+	knownBases := make(map[string]struct{}, len(agents))
 	for _, agent := range agents {
-		if agent.BaseDomain == "" {
-			continue
-		}
-		keys := []string{agent.Name, agent.BaseDomain}
-		seen := make(map[string]struct{}, len(keys))
-		for _, key := range keys {
-			if key == "" {
-				continue
-			}
-			if _, ok := seen[key]; ok {
-				continue
-			}
-			seen[key] = struct{}{}
-			if byName[key] == nil {
-				byName[key] = make(map[string]struct{})
-			}
-			byName[key][agent.BaseDomain] = struct{}{}
+		if agent.BaseDomain != "" {
+			knownBases[agent.BaseDomain] = struct{}{}
 		}
 	}
 	changed := false
 	for i, box := range boxes {
-		if box.BaseDomain != "" || nameCounts[box.Name] != 1 {
+		if box.BaseDomain != "" {
 			continue
 		}
-		candidates := byName[box.Name]
-		if len(candidates) != 1 {
+		baseDomain, ok := identities[boxIdentityKey(box)]
+		if !ok {
 			continue
 		}
-		for baseDomain := range candidates {
-			boxes[i].BaseDomain = baseDomain
-			changed = true
+		if _, ok := knownBases[baseDomain]; !ok {
+			continue
 		}
+		boxes[i].BaseDomain = baseDomain
+		changed = true
 	}
 	return boxes, changed
+}
+
+func persistLegacyIdentities(expectedHash, relayAPI, credential string, agents []relayclient.Agent, identities map[string]string) (config.ClientFile, bool, error) {
+	cf, err := config.LoadClientFile()
+	if err != nil {
+		return config.ClientFile{}, false, err
+	}
+	currentAPI, currentCredential := relayCredentials(cf)
+	if currentAPI != relayAPI || currentCredential != credential {
+		return cf, false, nil
+	}
+	if expectedHash != "" && relayCredentialHash(cf) != expectedHash {
+		return cf, false, nil
+	}
+	migrated, changed := migrateLegacyBoxes(cf.Boxes, agents, identities)
+	if !changed {
+		return cf, true, nil
+	}
+	cf.Boxes = migrated
+	if err := config.SaveClientFile(cf); err != nil {
+		return cf, true, err
+	}
+	return cf, true, nil
 }
 
 // relayOnly reports whether the box at i has no LAN path. LAN-addressable rows
@@ -258,16 +331,12 @@ func (v boxesView) liveRelayRow(box config.Box) bool {
 	return v.relayRows[relayKey(box)]
 }
 
-// rowIdentity is the selection key for a rendered row. Relay-only rows use
-// their persisted protocol identity and local rows use their config identity;
-// display Name alone is never enough because live and local inventory may share
-// an editable name.
+// rowIdentity is the selection key for a rendered row. BaseDomain is the
+// stable relay identity for both live-only and config-backed rows; provenance
+// controls permissions separately through liveRelayRow.
 func (v boxesView) rowIdentity(box config.Box) string {
-	if v.liveRelayRow(box) {
-		return "relay:" + box.BaseDomain
-	}
 	if box.BaseDomain != "" {
-		return "config-relay:" + box.BaseDomain
+		return "relay:" + box.BaseDomain
 	}
 	return "config:" + box.Name + "\x00" + box.Addr + "\x00" + box.Token
 }
@@ -299,7 +368,8 @@ func (v boxesView) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			selected = v.rowIdentity(v.boxes[v.cursor])
 		}
 		configChanged := !reflect.DeepEqual(v.configBoxes, msg.boxes) || v.current != msg.current
-		credentialsChanged := v.relayAPI != msg.relayAPI || v.credential != msg.credential
+		credentialsChanged := v.relayAPI != msg.relayAPI || v.credential != msg.credential ||
+			(v.relayCredentialHash != "" && msg.relayCredentialHash != "" && v.relayCredentialHash != msg.relayCredentialHash)
 		if v.configGeneration == 0 {
 			v.configGeneration = 1
 		} else if configChanged || credentialsChanged {
@@ -310,6 +380,7 @@ func (v boxesView) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		v.configBoxes, v.current, v.loaded = append([]config.Box(nil), msg.boxes...), msg.current, true
 		v.relayAPI, v.credential = msg.relayAPI, msg.credential
+		v.relayCredentialHash = msg.relayCredentialHash
 		if credentialsChanged {
 			v.relayAgents = nil
 			v.relayLoaded = false
@@ -365,6 +436,9 @@ func (v boxesView) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			(msg.relayAPI != v.relayAPI || msg.credential != v.credential) {
 			return v, nil
 		}
+		if msg.relayCredentialHash != "" && v.relayCredentialHash != "" && msg.relayCredentialHash != v.relayCredentialHash {
+			return v, nil
+		}
 		if msg.err != nil {
 			v.err = msg.err
 			return v, nil
@@ -373,13 +447,21 @@ func (v boxesView) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if v.cursor >= 0 && v.cursor < len(v.boxes) {
 			selected = v.rowIdentity(v.boxes[v.cursor])
 		}
-		migrated, changed := migrateLegacyBoxes(v.configBoxes, msg.agents)
-		if changed {
-			v.configBoxes = migrated
-			if msg.requestGeneration != 0 {
-				if err := config.SaveClientFile(config.ClientFile{Boxes: v.configBoxes, Current: v.current}); err != nil {
-					v.err = err
-				}
+		if msg.requestGeneration != 0 {
+			cf, accepted, err := persistLegacyIdentities(msg.relayCredentialHash, msg.relayAPI, msg.credential, msg.agents, msg.identities)
+			if err != nil {
+				v.err = err
+				return v, nil
+			}
+			if !accepted {
+				return v, nil
+			}
+			v.configBoxes = append([]config.Box(nil), cf.Boxes...)
+			v.current = cf.Current
+		} else {
+			migrated, changed := migrateLegacyBoxes(v.configBoxes, msg.agents, msg.identities)
+			if changed {
+				v.configBoxes = migrated
 			}
 		}
 		v.relayAgents = append([]relayclient.Agent(nil), msg.agents...)

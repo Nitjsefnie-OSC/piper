@@ -94,25 +94,28 @@ type (
 	// local-config load. relayAPI/credential are selected from any saved box so
 	// a non-relay current box does not hide the account's live enrollment list.
 	boxesLoadedMsg struct {
-		boxes      []config.Box
-		current    string
-		relayAPI   string
-		credential string
-		viewID     uint64
-		requestID  uint64
+		boxes               []config.Box
+		current             string
+		relayAPI            string
+		credential          string
+		relayCredentialHash string
+		viewID              uint64
+		requestID           uint64
 	}
 
 	// relayAgentsLoadedMsg carries the optional relay enrollment result. It is
 	// deliberately separate from boxesLoadedMsg so a slow relay cannot delay
 	// the local-config rows.
 	relayAgentsLoadedMsg struct {
-		agents            []relayclient.Agent
-		err               error
-		viewID            uint64
-		configGeneration  uint64
-		requestGeneration uint64
-		relayAPI          string
-		credential        string
+		agents              []relayclient.Agent
+		identities          map[string]string
+		err                 error
+		viewID              uint64
+		configGeneration    uint64
+		requestGeneration   uint64
+		relayAPI            string
+		credential          string
+		relayCredentialHash string
 	}
 
 	// switchBoxMsg is the boxes view's connect intent; the root dials the box,
