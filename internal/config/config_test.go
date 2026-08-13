@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -150,6 +151,53 @@ func TestClientConfigRoundTripsRelayFields(t *testing.T) {
 	}
 	if cc.RelayAPI != "https://api.public.getpiper.co" || cc.AccountCredential != "cred-xyz" {
 		t.Fatalf("cc = %+v", cc)
+	}
+}
+
+func TestSaveClientPreservesPersistedAgentIdentity(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("PIPER_ADDR", "")
+	t.Setenv("PIPER_TOKEN", "")
+	path := filepath.Join(home, ".piper", "piper", "config.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(`{"boxes":[{"name":"living-room","addr":"http://box:8088","base_domain":"cloud.example"}],"current":"living-room"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cc, err := LoadClient()
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientData, err := json.Marshal(cc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var clientRaw map[string]any
+	if err := json.Unmarshal(clientData, &clientRaw); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := clientRaw["base_domain"].(string); got != "cloud.example" {
+		t.Fatalf("LoadClient dropped persisted agent identity: %q", got)
+	}
+	if err := SaveClient(cc); err != nil {
+		t.Fatal(err)
+	}
+	cf, err := LoadClientFile()
+	if err != nil || len(cf.Boxes) != 1 {
+		t.Fatalf("saved config = %+v (%v)", cf, err)
+	}
+	data, err := json.Marshal(cf.Boxes[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := raw["base_domain"].(string); got != "cloud.example" {
+		t.Fatalf("SaveClient dropped persisted agent identity: %q", got)
 	}
 }
 
