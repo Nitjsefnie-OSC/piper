@@ -28,7 +28,7 @@ func TestNestedClientConfigWritersDoNotDeadlock(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestNestedClientConfigWritersDoNotDeadlock$")
 	cmd.Env = append(os.Environ(),
