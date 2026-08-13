@@ -98,14 +98,21 @@ type (
 		current    string
 		relayAPI   string
 		credential string
+		viewID     uint64
+		requestID  uint64
 	}
 
 	// relayAgentsLoadedMsg carries the optional relay enrollment result. It is
 	// deliberately separate from boxesLoadedMsg so a slow relay cannot delay
 	// the local-config rows.
 	relayAgentsLoadedMsg struct {
-		agents []relayclient.Agent
-		err    error
+		agents            []relayclient.Agent
+		err               error
+		viewID            uint64
+		configGeneration  uint64
+		requestGeneration uint64
+		relayAPI          string
+		credential        string
 	}
 
 	// switchBoxMsg is the boxes view's connect intent; the root dials the box,

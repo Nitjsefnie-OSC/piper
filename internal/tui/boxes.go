@@ -3,7 +3,9 @@ package tui
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -37,15 +39,30 @@ type boxesView struct {
 	relayAPI    string
 	credential  string
 	relayLoaded bool
+	viewID      uint64
+	// configGeneration changes when the loaded config or selected relay
+	// credentials change. Relay results are accepted only for the generation
+	// that launched them.
+	configGeneration uint64
+	latestRefreshID  uint64
+	// relayRequestGeneration distinguishes successive relay fetches within one
+	// view, including a replacement launched after a config change.
+	relayRequestGeneration uint64
 	// relayFetchStarted is intentionally one-shot for a view instance: relay
 	// liveness is fetched on entry, while the regular tick only refreshes local
 	// config and LAN probes.
 	relayFetchStarted bool
 }
 
+var (
+	boxesViewSequence    uint64
+	boxesRefreshSequence uint64
+)
+
 func newBoxesView(dial Dialer) boxesView {
 	return boxesView{
 		dial:           dial,
+		viewID:         atomic.AddUint64(&boxesViewSequence, 1),
 		reach:          map[string]bool{},
 		relayConnected: map[string]bool{},
 		relayRows:      map[string]bool{},
@@ -64,6 +81,8 @@ func (v boxesView) footer() string {
 // enrollment fetch is scheduled after this local result is rendered, so a slow
 // relay cannot hold the saved LAN rows in loading state.
 func (v boxesView) refresh(API) tea.Cmd {
+	viewID := v.viewID
+	requestID := atomic.AddUint64(&boxesRefreshSequence, 1)
 	return func() tea.Msg {
 		cf, err := config.LoadClientFile()
 		if err != nil {
@@ -75,6 +94,8 @@ func (v boxesView) refresh(API) tea.Cmd {
 			current:    cf.Current,
 			relayAPI:   relayAPI,
 			credential: credential,
+			viewID:     viewID,
+			requestID:  requestID,
 		}
 	}
 }
@@ -82,14 +103,23 @@ func (v boxesView) refresh(API) tea.Cmd {
 // fetchRelay loads the saved account's relay enrollment list off the UI
 // thread. Local rows are already visible by the time this command runs; a
 // relay failure is shown as a view error without removing those rows.
-func (v boxesView) fetchRelay() tea.Cmd {
+func (v boxesView) fetchRelay(configGeneration, requestGeneration uint64) tea.Cmd {
 	relay := v.relay
 	relayAPI, credential := v.relayAPI, v.credential
+	viewID := v.viewID
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), relayRequestTimeout)
 		defer cancel()
 		agents, err := relay(relayAPI).Agents(ctx, credential)
-		return relayAgentsLoadedMsg{agents: agents, err: err}
+		return relayAgentsLoadedMsg{
+			agents:            agents,
+			err:               err,
+			viewID:            viewID,
+			configGeneration:  configGeneration,
+			requestGeneration: requestGeneration,
+			relayAPI:          relayAPI,
+			credential:        credential,
+		}
 	}
 }
 
@@ -157,6 +187,54 @@ func mergeBoxes(local []config.Box, agents []relayclient.Agent, relayAPI, creden
 	return boxes, connected, relayRows
 }
 
+// migrateLegacyBoxes gives pre-base_domain configs a safe one-time upgrade
+// path. Older releases displayed the relay base domain as Name, so a legacy
+// local row may be paired with exactly one live agent by that old name. If the
+// name is ambiguous, leave the row untouched rather than guessing an identity.
+func migrateLegacyBoxes(local []config.Box, agents []relayclient.Agent) ([]config.Box, bool) {
+	boxes := append([]config.Box(nil), local...)
+	nameCounts := make(map[string]int, len(boxes))
+	for _, box := range boxes {
+		nameCounts[box.Name]++
+	}
+	byName := make(map[string]map[string]struct{}, len(agents))
+	for _, agent := range agents {
+		if agent.BaseDomain == "" {
+			continue
+		}
+		keys := []string{agent.Name, agent.BaseDomain}
+		seen := make(map[string]struct{}, len(keys))
+		for _, key := range keys {
+			if key == "" {
+				continue
+			}
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			if byName[key] == nil {
+				byName[key] = make(map[string]struct{})
+			}
+			byName[key][agent.BaseDomain] = struct{}{}
+		}
+	}
+	changed := false
+	for i, box := range boxes {
+		if box.BaseDomain != "" || nameCounts[box.Name] != 1 {
+			continue
+		}
+		candidates := byName[box.Name]
+		if len(candidates) != 1 {
+			continue
+		}
+		for baseDomain := range candidates {
+			boxes[i].BaseDomain = baseDomain
+			changed = true
+		}
+	}
+	return boxes, changed
+}
+
 // relayOnly reports whether the box at i has no LAN path. LAN-addressable rows
 // keep their LAN switch/probe path even when relay credentials are present;
 // relay-only rows use the live relay status when listed.
@@ -180,6 +258,20 @@ func (v boxesView) liveRelayRow(box config.Box) bool {
 	return v.relayRows[relayKey(box)]
 }
 
+// rowIdentity is the selection key for a rendered row. Relay-only rows use
+// their persisted protocol identity and local rows use their config identity;
+// display Name alone is never enough because live and local inventory may share
+// an editable name.
+func (v boxesView) rowIdentity(box config.Box) string {
+	if v.liveRelayRow(box) {
+		return "relay:" + box.BaseDomain
+	}
+	if box.BaseDomain != "" {
+		return "config-relay:" + box.BaseDomain
+	}
+	return "config:" + box.Name + "\x00" + box.Addr + "\x00" + box.Token
+}
+
 // probe returns a cmd that dials box and calls ListApps; reachable is true iff
 // both succeed. One cmd per box keeps a dead box from blocking the others.
 func (v boxesView) probe(box config.Box) tea.Cmd {
@@ -196,12 +288,39 @@ func (v boxesView) probe(box config.Box) tea.Cmd {
 func (v boxesView) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case boxesLoadedMsg:
+		if msg.viewID != 0 && msg.viewID != v.viewID {
+			return v, nil
+		}
+		if msg.requestID != 0 && msg.requestID < v.latestRefreshID {
+			return v, nil
+		}
 		selected := ""
 		if v.cursor >= 0 && v.cursor < len(v.boxes) {
-			selected = v.boxes[v.cursor].Name
+			selected = v.rowIdentity(v.boxes[v.cursor])
+		}
+		configChanged := !reflect.DeepEqual(v.configBoxes, msg.boxes) || v.current != msg.current
+		credentialsChanged := v.relayAPI != msg.relayAPI || v.credential != msg.credential
+		if v.configGeneration == 0 {
+			v.configGeneration = 1
+		} else if configChanged || credentialsChanged {
+			v.configGeneration++
+		}
+		if msg.requestID != 0 {
+			v.latestRefreshID = msg.requestID
 		}
 		v.configBoxes, v.current, v.loaded = append([]config.Box(nil), msg.boxes...), msg.current, true
 		v.relayAPI, v.credential = msg.relayAPI, msg.credential
+		if credentialsChanged {
+			v.relayAgents = nil
+			v.relayLoaded = false
+			v.relayConnected = map[string]bool{}
+			v.relayRows = map[string]bool{}
+			v.relayFetchStarted = false
+		} else if configChanged && !v.relayLoaded {
+			// An in-flight result for the old config must be rejected; allow a
+			// replacement request for the new config to establish a fresh snapshot.
+			v.relayFetchStarted = false
+		}
 		if v.relayLoaded {
 			v.boxes, v.relayConnected, v.relayRows = mergeBoxes(v.configBoxes, v.relayAgents, v.relayAPI, v.credential)
 		} else {
@@ -213,7 +332,7 @@ func (v boxesView) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if selected != "" {
 			for i, box := range v.boxes {
-				if box.Name == selected {
+				if v.rowIdentity(box) == selected {
 					v.cursor = i
 					break
 				}
@@ -222,7 +341,8 @@ func (v boxesView) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		var cmds []tea.Cmd
 		if !v.relayFetchStarted && v.relay != nil && msg.relayAPI != "" && msg.credential != "" {
 			v.relayFetchStarted = true
-			cmds = append(cmds, v.fetchRelay())
+			v.relayRequestGeneration++
+			cmds = append(cmds, v.fetchRelay(v.configGeneration, v.relayRequestGeneration))
 		}
 		for i, box := range v.boxes {
 			if box.Name == v.current || v.relayOnly(i) {
@@ -232,9 +352,35 @@ func (v boxesView) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return v, tea.Batch(cmds...)
 	case relayAgentsLoadedMsg:
+		if msg.viewID != 0 && msg.viewID != v.viewID {
+			return v, nil
+		}
+		if msg.configGeneration != 0 && msg.configGeneration != v.configGeneration {
+			return v, nil
+		}
+		if msg.requestGeneration != 0 && msg.requestGeneration != v.relayRequestGeneration {
+			return v, nil
+		}
+		if (msg.relayAPI != "" || msg.credential != "") &&
+			(msg.relayAPI != v.relayAPI || msg.credential != v.credential) {
+			return v, nil
+		}
 		if msg.err != nil {
 			v.err = msg.err
 			return v, nil
+		}
+		selected := ""
+		if v.cursor >= 0 && v.cursor < len(v.boxes) {
+			selected = v.rowIdentity(v.boxes[v.cursor])
+		}
+		migrated, changed := migrateLegacyBoxes(v.configBoxes, msg.agents)
+		if changed {
+			v.configBoxes = migrated
+			if msg.requestGeneration != 0 {
+				if err := config.SaveClientFile(config.ClientFile{Boxes: v.configBoxes, Current: v.current}); err != nil {
+					v.err = err
+				}
+			}
 		}
 		v.relayAgents = append([]relayclient.Agent(nil), msg.agents...)
 		v.relayLoaded = true
@@ -242,6 +388,14 @@ func (v boxesView) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		v.err = nil
 		if v.cursor >= len(v.boxes) {
 			v.cursor = max(0, len(v.boxes)-1)
+		}
+		if selected != "" {
+			for i, box := range v.boxes {
+				if v.rowIdentity(box) == selected {
+					v.cursor = i
+					break
+				}
+			}
 		}
 		return v, nil
 	case boxProbeMsg:
