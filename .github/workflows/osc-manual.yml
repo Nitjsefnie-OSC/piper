@@ -1,7 +1,7 @@
 # Fork-only manual CI wrapper. Not upstream's file and never sent upstream:
 # it exists solely so a feature branch on this fork can be verified without
-# opening a pull request. It carries ci.yml's `verify` job steps behind a
-# workflow_dispatch checkout of the ref passed in.
+# opening a pull request. It carries ci.yml's `verify` job steps and e2e.yml's
+# `e2e` job steps behind a workflow_dispatch checkout of the ref passed in.
 #
 # The paths-filter gating in ci.yml is deliberately absent: it computes a diff
 # against a base ref that workflow_dispatch does not have, and every step it
@@ -86,3 +86,31 @@ jobs:
 
       - name: Verify brew archives
         run: ./test/packaging/verify_brew.sh
+
+  # Mirrors e2e.yml's `e2e` job verbatim, behind the same dispatch checkout.
+  # e2e.yml's `paths:` trigger filter is absent for the same reason as the
+  # ci.yml paths-filter: workflow_dispatch has no diff base, and the suite is
+  # wanted unconditionally for a Go-touching ref.
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: "${{ inputs.target_ref }}"
+
+      - name: Show checked-out ref
+        run: |
+          echo "requested ref: ${{ inputs.target_ref }}"
+          echo "checked-out SHA: $(git rev-parse HEAD)"
+          git log -1 --oneline
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+
+      - name: Allow non-root bind to :80
+        run: sudo sysctl -w net.ipv4.ip_unprivileged_port_start=80
+
+      - name: e2e
+        run: make e2e
